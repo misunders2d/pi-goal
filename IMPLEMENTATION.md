@@ -9,10 +9,10 @@ This package ships only when the complete product contract is satisfied.
 - [x] Typed authority envelope and fail-closed generic safety
 - [x] Full-idle, background-work, stale continuation, and doom-loop guards
 - [x] Metadata-only evidence with secret redaction
-- [x] Setup-approved constrained verification checks
+- [x] Setup-approved constrained verification checks with preflight targets and bounded recovery
 - [x] Isolated evaluator and independent final auditor
 - [x] Pause, resume, cancel, and four actionable interrupt classes
 - [x] Unit, integration, persistence, safety, audit, and TUI rendering tests
 - [x] Isolated real Pi load and TUI smoke at narrow/medium/wide widths
-- [ ] Gallery screenshot, npm tarball smoke, GitHub release, npm publication
-- [ ] Legacy `/goal` removed only after standalone migration passes
+- [x] Gallery screenshot, npm tarball smoke, GitHub release, npm publication
+- [x] Legacy `/goal` removed only after standalone migration passes

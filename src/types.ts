@@ -222,6 +222,9 @@ export interface GoalState {
 	turnCount: number;
 	recoveryCount: number;
 	auditFailureCount: number;
+	verificationFailureSignature?: string;
+	verificationFailureCount: number;
+	verificationRecoveryStartedAt?: string;
 	noProgressCount: number;
 	lastProgressMarker?: string;
 	repeatedToolCalls: Record<string, number>;

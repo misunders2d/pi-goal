@@ -59,6 +59,8 @@ const GOAL_TOOL_NAMES = new Set([
 const TERMINAL_STATES = new Set(["completed", "complete", "failed", "error", "cancelled", "canceled", "done", "finished"]);
 const ACTIVE_STATES = new Set(["queued", "pending", "running", "in_progress", "in-progress", "started", "watching"]);
 const CONTINUATION_CUSTOM_TYPE = "pi-goal-continuation-v1";
+const MAX_IDENTICAL_VERIFICATION_FAILURES = 2;
+const MAX_VERIFICATION_RECOVERY_MS = 10 * 60 * 1_000;
 
 function textContent(text: string) {
 	return [{ type: "text" as const, text }];
@@ -314,6 +316,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 	let currentCtx: ExtensionContext | undefined;
 	let evaluatorInFlight = false;
 	let shutdown = false;
+	let verificationRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
 
 	function refreshToolInfo(): void {
 		toolInfo.clear();
@@ -342,6 +345,118 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		pi.sendMessage({ customType: CONTINUATION_CUSTOM_TYPE, content: textContent(message), display: false, details: { goalId: state.goalId, generation: state.generation, sequence } }, { triggerTurn: true, deliverAs: "followUp" });
 	}
 
+	function armFreshContinuation(state: GoalState): void {
+		state.continuationSequence += 1;
+		state.lastContinuationKey = undefined;
+	}
+
+	function noteVerificationFailure(state: GoalState, failures: VerificationResult[]): { blocked: boolean; elapsedMs: number } {
+		const signature = sha256(failures.map((failure) => `${failure.checkId}\n${failure.summary}`).join("\n---\n"));
+		const at = now();
+		if (state.verificationFailureSignature === signature) state.verificationFailureCount += 1;
+		else {
+			state.verificationFailureSignature = signature;
+			state.verificationFailureCount = 1;
+			state.verificationRecoveryStartedAt = at;
+		}
+		const started = Date.parse(state.verificationRecoveryStartedAt ?? at);
+		const elapsedMs = Number.isFinite(started) ? Math.max(0, Date.now() - started) : 0;
+		return {
+			blocked: state.verificationFailureCount >= MAX_IDENTICAL_VERIFICATION_FAILURES || elapsedMs >= MAX_VERIFICATION_RECOVERY_MS,
+			elapsedMs,
+		};
+	}
+
+	function clearVerificationRecoveryTimer(): void {
+		if (verificationRecoveryTimer) clearTimeout(verificationRecoveryTimer);
+		verificationRecoveryTimer = undefined;
+	}
+
+	function clearVerificationFailure(state: GoalState): void {
+		clearVerificationRecoveryTimer();
+		state.verificationFailureSignature = undefined;
+		state.verificationFailureCount = 0;
+		state.verificationRecoveryStartedAt = undefined;
+	}
+
+	function scheduleVerificationRecoveryTimeout(ctx: ExtensionContext, state: GoalState): void {
+		clearVerificationRecoveryTimer();
+		if (state.status !== "running" || !state.verificationFailureSignature || !state.verificationRecoveryStartedAt) return;
+		const goalId = state.goalId;
+		const signature = state.verificationFailureSignature;
+		const started = Date.parse(state.verificationRecoveryStartedAt);
+		const elapsed = Number.isFinite(started) ? Math.max(0, Date.now() - started) : 0;
+		const delay = Math.max(1, MAX_VERIFICATION_RECOVERY_MS - elapsed);
+		verificationRecoveryTimer = setTimeout(() => {
+			verificationRecoveryTimer = undefined;
+			void (async () => {
+				let shouldAbort = false;
+				await mutex.run(() => {
+					const current = load(ctx);
+					if (!current || current.goalId !== goalId || current.status !== "running" || current.verificationFailureSignature !== signature) return;
+					openInterrupt(current, {
+						class: "BLOCKER",
+						message: "Approved verification recovery exceeded the 10-minute limit.",
+						attempts: current.evidence.filter((item) => item.kind === "verification_check" && item.isError).slice(-4).map((item) => item.summary),
+						need: "A targeted fix for the displayed approved check, or a user decision about an impossible criterion.",
+						recommendation: "Use the displayed sanitized check target to decide whether to amend or cancel the goal.",
+					});
+					persist(ctx, "verification_recovery_timeout", "approved verification recovery exceeded 10 minutes");
+					shouldAbort = true;
+				});
+				if (shouldAbort) { ctx.abort(); await isolated.abortAll(); }
+			})();
+		}, delay);
+		verificationRecoveryTimer.unref?.();
+	}
+
+	function recordVerificationResults(state: GoalState, checks: VerificationResult[]): void {
+		for (const result of checks) {
+			state.evidence.push({
+				id: makeId("evidence"),
+				kind: "verification_check",
+				summary: redactText(result.summary, 1_200).text,
+				criterionIds: [],
+				paths: [],
+				exitCode: result.exitCode,
+				isError: !result.passed,
+				createdAt: now(),
+			});
+		}
+	}
+
+	function transitionVerificationFailure(ctx: ExtensionContext, state: GoalState, checks: VerificationResult[], queueContinuation: boolean): void {
+		const failures = checks.filter((item) => !item.passed);
+		const recovery = noteVerificationFailure(state, failures);
+		state.auditFailureCount += 1;
+		state.completionCandidate = false;
+		state.status = "running";
+		state.phase = "recovering";
+		state.currentAction = "Repairing failed verification";
+		state.nextAction = failures[0]?.summary ?? "Repair verification";
+		if (state.auditFailureCount >= 3 || recovery.blocked) {
+			const elapsedMinutes = Math.max(1, Math.ceil(recovery.elapsedMs / 60_000));
+			const identicalFailure = state.verificationFailureCount >= MAX_IDENTICAL_VERIFICATION_FAILURES;
+			const timedOut = recovery.elapsedMs >= MAX_VERIFICATION_RECOVERY_MS;
+			openInterrupt(state, {
+				class: "BLOCKER",
+				message: identicalFailure
+					? "Approved verification failed identically after a bounded repair attempt."
+					: timedOut
+						? `Approved verification recovery exceeded ${elapsedMinutes} minute${elapsedMinutes === 1 ? "" : "s"}.`
+						: "Approved verification failed repeatedly across bounded recovery attempts.",
+				attempts: state.evidence.filter((item) => item.kind === "verification_check" && item.isError).slice(-4).map((item) => item.summary),
+				need: "A targeted fix for the displayed approved check, or a user decision about an impossible criterion.",
+				recommendation: "Use the displayed sanitized check target to decide whether to amend or cancel the goal.",
+			});
+		}
+		persist(ctx, "verification_failed", state.nextAction);
+		if (state.status === "running") {
+			scheduleVerificationRecoveryTimeout(ctx, state);
+			if (queueContinuation) triggerContinuation(state, "Verification failed. Repair the displayed approved check target; do not repeat the same action unchanged.");
+		} else clearVerificationRecoveryTimer();
+	}
+
 	function canResumeAutonomy(ctx: ExtensionContext, state: GoalState): boolean {
 		return state.status === "running"
 			&& !state.interrupt
@@ -353,8 +468,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 
 	function queueFreshContinuation(ctx: ExtensionContext, state: GoalState, eventType: string, reason: string): void {
 		if (!canResumeAutonomy(ctx, state)) return;
-		state.continuationSequence += 1;
-		state.lastContinuationKey = undefined;
+		armFreshContinuation(state);
 		persist(ctx, eventType, reason);
 		triggerContinuation(state, reason);
 	}
@@ -426,18 +540,8 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		await mutex.run(() => {
 			const state = load(ctx);
 			if (!state || state.goalId !== goalId || state.generation !== generation || state.continuationSequence !== sequence) return;
-			for (const result of checks) {
-				state.evidence.push({
-					id: makeId("evidence"),
-					kind: "verification_check",
-					summary: redactText(result.summary, 300).text,
-					criterionIds: [],
-					paths: [],
-					exitCode: result.exitCode,
-					isError: !result.passed,
-					createdAt: now(),
-				});
-			}
+			recordVerificationResults(state, checks);
+			if (checks.length && checks.every((result) => result.passed)) clearVerificationFailure(state);
 			persist(ctx, "verification_completed", `verification checks ${checks.filter((item) => item.passed).length}/${checks.length}`);
 			snapshot = structuredClone(state);
 		});
@@ -446,15 +550,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			await mutex.run(() => {
 				const state = load(ctx);
 				if (!state || state.goalId !== goalId || state.generation !== generation || state.continuationSequence !== sequence) return;
-				state.auditFailureCount += 1;
-				state.completionCandidate = false;
-				state.status = "running";
-				state.phase = "recovering";
-				state.currentAction = "Repairing failed verification";
-				state.nextAction = checks.find((item) => !item.passed)?.summary ?? "Repair verification";
-				if (state.auditFailureCount >= 3) openInterrupt(state, { class: "BLOCKER", message: "Approved verification failed repeatedly.", attempts: checks.filter((item) => !item.passed).map((item) => item.summary), need: "A working implementation or a user decision about an impossible criterion.", recommendation: "Inspect the failed checks and choose whether to revise the outcome." });
-				persist(ctx, "verification_failed", state.nextAction);
-				if (state.status === "running") triggerContinuation(state, "Verification failed. Diagnose and repair; do not repeat the same action unchanged.");
+				transitionVerificationFailure(ctx, state, checks, true);
 			});
 			return;
 		}
@@ -484,6 +580,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			const adjudication = validateAuditCompletion(state, audit);
 			state.auditReports.push({ id: makeId("audit"), verdict: adjudication.valid ? "pass" : "fail", reason: redactText(audit.reason, 800).text, criterionResults: audit.criterionResults, missingCriteria: audit.missingCriteria.map((item) => redactText(item, 300).text), createdAt: now() });
 			if (adjudication.valid) {
+				clearVerificationFailure(state);
 				state.criteria = adjudication.criteria;
 				state.status = "completed";
 				state.phase = "done";
@@ -597,6 +694,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			if (!await ctx.ui.confirm("Cancel goal?", "Stop autonomous execution? Existing workspace changes are not reverted.")) return;
 			await mutex.run(() => {
 				const state = load(ctx); if (!state) return;
+				clearVerificationRecoveryTimer();
 				state.status = "cancelled"; state.phase = "done"; state.continuationSequence += 1; state.lastContinuationKey = undefined;
 				persist(ctx, "goal_cancelled", "user cancelled goal"); updateGoalUi(ctx, undefined);
 			});
@@ -610,11 +708,12 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				const state = load(ctx); if (!state) return;
 				if (action === "pause") {
 					if (state.status !== "running" && state.status !== "auditing") return;
+					clearVerificationRecoveryTimer();
 					state.status = "paused"; state.continuationSequence += 1; state.lastContinuationKey = undefined; state.currentAction = "Paused by user"; changed = true;
 				} else {
 					if (state.status !== "paused") return;
 					if (state.interrupt) { state.status = "interrupted"; state.phase = "blocked"; persist(ctx, "goal_resume_refused", "resolve the active interruption before resuming"); return; }
-					state.status = "running"; state.phase = "recovering"; state.continuationSequence += 1; state.lastContinuationKey = undefined; state.currentAction = "Resuming goal"; changed = true;
+					state.status = "running"; state.phase = "recovering"; state.continuationSequence += 1; state.lastContinuationKey = undefined; state.currentAction = "Resuming goal"; scheduleVerificationRecoveryTimeout(ctx, state); changed = true;
 				}
 				persist(ctx, action === "pause" ? "goal_paused" : "goal_resumed", `user ${action}d goal`);
 				if (action === "resume") triggerContinuation(state, "Resume from durable state and inspect current evidence before acting.");
@@ -807,15 +906,37 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "pi_goal_submit_completion_candidate",
 		label: "Submit Goal Completion Candidate",
-		description: "Ask the constrained verifier and isolated auditor to judge completion. This does not complete the goal.",
+		description: "Preflight approved checks, then ask the isolated auditor to judge completion. This does not complete the goal.",
 		parameters: Type.Object({ ...Expected, summary: Type.String() }),
-		execute: async (_id, params, _signal, _update, ctx) => mutex.run(() => {
-			const state = load(ctx); if (!state || state.status !== "running") throw new Error("No running goal"); validGeneration(state, params.goalId, params.generation);
-			if (!state.evidence.length || state.criteria.some((criterion) => !state.evidence.some((evidence) => evidence.criterionIds.includes(criterion.id)))) throw new Error("Every criterion needs linked evidence before completion candidacy");
-			if (Object.keys(state.backgroundWork).length) throw new Error("Background work is still active");
-			state.completionCandidate = true; state.phase = "verifying"; state.currentAction = "Awaiting independent completion audit"; state.nextAction = "Run approved checks";
-			persist(ctx, "completion_candidate", params.summary); return toolResult("Completion candidate recorded. The worker has not completed the goal; isolated verification runs after settlement.");
-		}),
+		execute: async (_id, params, signal, _update, ctx) => {
+			let snapshot: GoalState | undefined;
+			let sequence = 0;
+			await mutex.run(() => {
+				const state = load(ctx); if (!state || state.status !== "running") throw new Error("No running goal"); validGeneration(state, params.goalId, params.generation);
+				if (!state.evidence.length || state.criteria.some((criterion) => !state.evidence.some((evidence) => evidence.criterionIds.includes(criterion.id)))) throw new Error("Every criterion needs linked evidence before completion candidacy");
+				if (Object.keys(state.backgroundWork).length) throw new Error("Background work is still active");
+				sequence = state.continuationSequence;
+				snapshot = structuredClone(state);
+			});
+			let checks: VerificationResult[];
+			try { checks = await runAllChecks(snapshot!, signal); }
+			catch (error) { checks = [{ checkId: "runner", passed: false, summary: error instanceof Error ? error.message : String(error), durationMs: 0 }]; }
+			return mutex.run(() => {
+				const state = load(ctx);
+				if (!state || state.status !== "running") throw new Error("Goal changed while completion checks were running");
+				validGeneration(state, params.goalId, params.generation);
+				if (state.continuationSequence !== sequence) throw new Error("Goal changed while completion checks were running");
+				recordVerificationResults(state, checks);
+				if (!checks.length || checks.some((result) => !result.passed)) {
+					transitionVerificationFailure(ctx, state, checks, false);
+					return toolResult(`Completion candidate rejected by approved checks. ${checks.find((result) => !result.passed)?.summary ?? "No verification result was produced."}`, { checks });
+				}
+				clearVerificationFailure(state);
+				state.completionCandidate = true; state.phase = "verifying"; state.currentAction = "Awaiting independent completion audit"; state.nextAction = "Run approved checks";
+				persist(ctx, "completion_candidate", params.summary);
+				return toolResult("Approved checks passed. Completion candidate recorded; the isolated auditor runs after settlement.", { checks });
+			});
+		},
 	});
 
 	pi.registerTool({
@@ -832,7 +953,10 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		shutdown = false;
 		refreshToolInfo();
 		const state = load(ctx);
-		if (state?.status === "running") queueFreshContinuation(ctx, state, "session_restored", `Resume active goal after ${event.reason}.`);
+		if (state?.status === "running") {
+			scheduleVerificationRecoveryTimeout(ctx, state);
+			queueFreshContinuation(ctx, state, "session_restored", `Resume active goal after ${event.reason}.`);
+		}
 	});
 	pi.on("resources_discover", () => { refreshToolInfo(); });
 	pi.on("context", (event, ctx) => {
@@ -862,17 +986,19 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			const text = event.text.trim();
 			if (/^(?:pause|pause goal|pause the goal)$/i.test(text)) {
 				if (state.status === "running" || state.status === "auditing") {
+					clearVerificationRecoveryTimer();
 					state.status = "paused"; state.continuationSequence += 1; state.lastContinuationKey = undefined; state.currentAction = "Paused by user"; persist(ctx, "goal_paused", "natural-language pause"); abortActive = true;
 				}
 				return { action: "handled" as const };
 			}
 			if (/^(?:resume|resume goal|resume the goal)$/i.test(text)) {
 				if (state.status === "paused" && !state.interrupt) {
-					state.status = "running"; state.phase = "recovering"; state.continuationSequence += 1; state.lastContinuationKey = undefined; persist(ctx, "goal_resumed", "natural-language resume"); triggerContinuation(state, "Resume from durable state.");
+					state.status = "running"; state.phase = "recovering"; state.continuationSequence += 1; state.lastContinuationKey = undefined; scheduleVerificationRecoveryTimeout(ctx, state); persist(ctx, "goal_resumed", "natural-language resume"); triggerContinuation(state, "Resume from durable state.");
 				} else if (state.interrupt) ctx.ui.notify("Resolve the active interruption before resuming.", "warning");
 				return { action: "handled" as const };
 			}
 			if (/^(?:cancel|cancel goal|cancel the goal|stop goal|stop the goal)$/i.test(text)) {
+				clearVerificationRecoveryTimer();
 				state.status = "cancelled"; state.phase = "done"; state.continuationSequence += 1; state.lastContinuationKey = undefined; persist(ctx, "goal_cancelled", "natural-language cancellation"); updateGoalUi(ctx, undefined); abortActive = true; return { action: "handled" as const };
 			}
 			if (/^approve exact pending risk once$/i.test(text) && state.interrupt?.pendingAction) {
@@ -884,6 +1010,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				return { action: "handled" as const };
 			}
 			const cleaned = redactText(text, 2_000);
+			clearVerificationFailure(state);
 			state.outcome.amendments.push({ id: makeId("steering"), text: cleaned.text, createdAt: now() }); state.generation += 1; state.continuationSequence += 1; state.lastContinuationKey = undefined; state.completionCandidate = false; state.currentAction = "Applying user steering"; state.nextAction = cleaned.text;
 			persist(ctx, "user_steering", "user supplied natural-language steering");
 			if (state.status === "paused" || state.status === "interrupted") return { action: "handled" as const };
@@ -988,6 +1115,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 	});
 	pi.on("session_shutdown", async (_event, ctx) => {
 		shutdown = true;
+		clearVerificationRecoveryTimer();
 		const state = load(ctx);
 		if (state) { state.continuationSequence += 1; state.lastContinuationKey = undefined; store.flush(ctx, "session shutdown"); }
 		currentCtx = undefined;

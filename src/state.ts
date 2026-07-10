@@ -186,6 +186,7 @@ export function createGoalState(draft: GoalDraft, ctx: ExtensionContext): GoalSt
 		turnCount: 0,
 		recoveryCount: 0,
 		auditFailureCount: 0,
+		verificationFailureCount: 0,
 		noProgressCount: 0,
 		repeatedToolCalls: {},
 		repeatedBlockers: {},
@@ -222,6 +223,7 @@ export function normalizeState(raw: unknown): GoalState | undefined {
 	value.turnCount = value.turnCount ?? 0;
 	value.recoveryCount = value.recoveryCount ?? 0;
 	value.auditFailureCount = value.auditFailureCount ?? 0;
+	value.verificationFailureCount = value.verificationFailureCount ?? 0;
 	value.noProgressCount = value.noProgressCount ?? 0;
 	value.completionCandidate = !!value.completionCandidate;
 	return value as GoalState;

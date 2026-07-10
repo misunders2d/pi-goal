@@ -26,7 +26,18 @@ test("runAllChecks labels mechanical failures with approved check semantics", as
 		writeFileSync(join(root, "READY.md"), "READY\n");
 		const [result] = await runAllChecks({ cwd: root, verificationChecks: [{ id: "V2", kind: "command_exit", label: "READY.md content is exactly READY", executable: "node", args: ["-e", "const fs=require('fs');process.exit(fs.readFileSync('READY.md','utf8')==='READY'?0:1)"], expectedExitCode: 0 }] } as any);
 		assert.equal(result.passed, false);
-		assert.match(result.summary, /setup-approved check V2 "READY\.md content is exactly READY": command exited 1; expected 0/);
+		assert.match(result.summary, /setup-approved check V2 "READY\.md content is exactly READY" \(executable="node" cwd="\." argv=/);
+		assert.match(result.summary, /command exited 1; expected 0/);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("labeled file failures expose the sanitized approved target", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-target-fail-"));
+	try {
+		const [result] = await runAllChecks({ cwd: root, verificationChecks: [{ id: "V1", kind: "file_exists", label: "report exists", path: "Downloads/goal-command-test-report.md" }] } as any);
+		assert.equal(result.passed, false);
+		assert.match(result.summary, /path="Downloads\/goal-command-test-report\.md"/);
+		assert.match(result.summary, /required file is missing/);
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 

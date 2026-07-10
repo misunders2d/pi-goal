@@ -3,7 +3,7 @@ import { isAbsolute, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { Type } from "typebox";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { isSensitivePath, isWithinWorkspace, redactText } from "./state.ts";
+import { isSensitivePath, isWithinWorkspace, redactText, safeEvidencePath } from "./state.ts";
 import type { GoalState, VerificationCheck, VerificationResult } from "./types.ts";
 
 const DENIED_EXECUTABLES = new Set([
@@ -142,14 +142,33 @@ export async function runVerificationCheck(check: VerificationCheck, workspace: 
 	}
 }
 
-function labelApprovedCheckResult(check: VerificationCheck, result: VerificationResult): VerificationResult {
+export function describeVerificationCheck(check: VerificationCheck, workspace: string): string {
+	switch (check.kind) {
+		case "file_exists":
+		case "file_contains":
+		case "json_equals":
+			return `path=${JSON.stringify(safeEvidencePath(workspace, check.path))}`;
+		case "command_exit": {
+			const cwd = check.cwd ? safeEvidencePath(workspace, check.cwd) : ".";
+			const executable = redactText(check.executable, 80).text;
+			const argv = redactText(JSON.stringify(check.args.map((arg) => redactText(arg, 240).text)), 900).text;
+			return `executable=${JSON.stringify(executable)} cwd=${JSON.stringify(cwd)} argv=${argv}`;
+		}
+		case "git_status":
+			return `workspace=${JSON.stringify(safeEvidencePath(workspace, "."))}`;
+		case "git_diff":
+			return `paths=${redactText(JSON.stringify((check.paths ?? []).map((path) => safeEvidencePath(workspace, path))), 500).text}`;
+	}
+}
+
+function labelApprovedCheckResult(check: VerificationCheck, result: VerificationResult, workspace: string): VerificationResult {
 	const label = JSON.stringify(redactText(check.label, 120).text);
-	return { ...result, summary: `setup-approved check ${check.id} ${label}: ${result.summary}` };
+	return { ...result, summary: `setup-approved check ${check.id} ${label} (${describeVerificationCheck(check, workspace)}): ${result.summary}` };
 }
 
 export async function runAllChecks(state: GoalState, signal?: AbortSignal): Promise<VerificationResult[]> {
 	const results: VerificationResult[] = [];
-	for (const check of state.verificationChecks) results.push(labelApprovedCheckResult(check, await runVerificationCheck(check, state.cwd, signal)));
+	for (const check of state.verificationChecks) results.push(labelApprovedCheckResult(check, await runVerificationCheck(check, state.cwd, signal), state.cwd));
 	return results;
 }
 
