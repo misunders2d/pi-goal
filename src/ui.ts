@@ -79,8 +79,10 @@ export function detailContent(state: GoalState, width: number): string[] {
 	if (state.interrupt) section(lines, `${state.interrupt.class} interruption`, [state.interrupt.message, `Tried: ${state.interrupt.attempts.join("; ") || "none"}`, `Need: ${state.interrupt.need}`, `Recommendation: ${state.interrupt.recommendation}`], width);
 	section(lines, "Controls", [
 		state.status === "paused" ? "P resume" : "P pause",
-		...(state.interrupt?.pendingAction ? ["A approve the exact pending risk once"] : []),
-		...(state.status === "interrupted" ? ["R provide blocker resolution"] : []),
+		...(state.interrupt?.pendingAction ? [
+			"A approve only the displayed pending action once (not a general resume)",
+			"R reject or redirect the displayed action with a resolution",
+		] : state.status === "interrupted" ? ["R provide blocker resolution"] : []),
 		"C cancel goal",
 		"Esc close",
 	], width);

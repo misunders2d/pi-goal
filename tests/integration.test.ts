@@ -123,7 +123,12 @@ test("restores running state, injects it every turn, and blocks out-of-workspace
 		assert.equal(allowed, undefined);
 		const blocked = (await harness.emit("tool_call", { type: "tool_call", toolName: "write", toolCallId: "w2", input: { path: "../outside", content: "x" } })).find(Boolean);
 		assert.equal(blocked.block, true);
-		assert.match(blocked.reason, /Goal RISK/);
+		assert.match(blocked.reason, /Goal blocked unapproved action/);
+		const persisted = latestState(harness);
+		assert.equal(persisted.status, "running");
+		assert.equal(persisted.phase, "recovering");
+		assert.equal(persisted.interrupt, undefined);
+		assert.equal(persisted.deferredRisk.toolName, "write");
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -170,7 +175,7 @@ test("private and secret reads soft-deny without persisting sensitive input", as
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("destructive and external mutations still open RISK", async () => {
+test("unapproved destructive and external attempts stay blocked while goal recovers autonomously", async () => {
 	const cases: Array<[string, string, Record<string, unknown>]> = [
 		["complex deletion", "bash", { command: "echo ok; rm -rf dist" }],
 		["remote git", "bash", { command: "git push origin main" }],
@@ -186,13 +191,34 @@ test("destructive and external mutations still open RISK", async () => {
 			await harness.emit("session_start", { type: "session_start", reason: "resume" });
 			const blocked = (await harness.emit("tool_call", { type: "tool_call", toolName, toolCallId: `hard-${label}`, input })).find(Boolean);
 			assert.equal(blocked.block, true, label);
-			assert.match(blocked.reason, /Goal RISK/, label);
+			assert.match(blocked.reason, /Goal blocked unapproved action/, label);
 			const persisted = latestState(harness);
-			assert.equal(persisted.status, "interrupted", label);
-			assert.equal(persisted.interrupt.class, "RISK", label);
-			assert.ok(persisted.interrupt.pendingAction, label);
+			assert.equal(persisted.status, "running", label);
+			assert.equal(persisted.phase, "recovering", label);
+			assert.equal(persisted.interrupt, undefined, label);
+			assert.equal(persisted.deferredRisk.toolName, toolName, label);
 		} finally { rmSync(root, { recursive: true, force: true }); }
 	}
+});
+
+test("genuine RISK needs a blocked exact action plus a successful safe alternative attempt", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root);
+		const initial = injectRunning(harness);
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		await harness.emit("tool_call", { type: "tool_call", toolName: "bash", toolCallId: "push", input: { command: "git push origin main" } });
+		const request = { goalId: initial.goalId, generation: initial.generation, class: "RISK", message: "Publishing is required", attempts: ["Tried local verification"], need: "Exact push approval", recommendation: "Approve once" };
+		await assert.rejects(() => harness.tool("pi_goal_request_interrupt", request), /safe alternative attempt/);
+		await harness.emit("tool_call", { type: "tool_call", toolName: "read", toolCallId: "read-alternative", input: { path: "README.md" } });
+		await harness.emit("tool_result", { type: "tool_result", toolName: "read", toolCallId: "read-alternative", input: { path: "README.md" }, isError: false, content: [], details: {} });
+		await harness.tool("pi_goal_request_interrupt", request);
+		const persisted = latestState(harness);
+		assert.equal(persisted.status, "interrupted");
+		assert.equal(persisted.interrupt.class, "RISK");
+		assert.equal(persisted.interrupt.pendingAction.toolName, "bash");
+		assert.equal(persisted.deferredRisk, undefined);
+	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("hidden goal context includes redacted immutable approved-check semantics", async () => {
@@ -333,6 +359,29 @@ test("planner rejects circular audit-process criteria before approval", () => {
 		authorities: [], constraints: [], nonGoals: [],
 	}, "Create READY.md");
 	assert.deepEqual(substantive.criteria, ["READY.md exists"]);
+});
+
+test("planner rejects development-only checks against installed packages", () => {
+	const base = {
+		outcome: "Validate installed goal package",
+		criteria: ["Installed package is healthy"],
+		phases: [{ id: "P1", title: "Validate", criterionIds: ["AC1"] }],
+		authorities: [], constraints: [], nonGoals: [],
+	};
+	assert.match(SETUP_PLANNER_SYSTEM_PROMPT, /installed packages beneath node_modules/);
+	assert.throws(() => normalizeDraft({
+		...base,
+		verificationChecks: [{ id: "V1", kind: "command_exit", label: "complete package check", executable: "npm", args: ["run", "check"], cwd: "/home/user/.pi/agent/npm/node_modules/@scope/pkg" }],
+	}, base.outcome, "/home/user"), /development-only verification.*V1.*complete package check/);
+	assert.throws(() => normalizeDraft({
+		...base,
+		verificationChecks: [{ id: "V1", kind: "command_exit", label: "tests", executable: "npm", args: ["--prefix", ".pi/agent/npm/node_modules/@scope/pkg", "test"] }],
+	}, base.outcome, "/home/user"), /development-only verification/);
+	const sourceCheck = normalizeDraft({
+		...base,
+		verificationChecks: [{ id: "V1", kind: "command_exit", label: "source package check", executable: "npm", args: ["run", "check"], cwd: "/home/user/src/pi-goal" }],
+	}, base.outcome, "/home/user");
+	assert.equal(sourceCheck.verificationChecks.length, 1);
 });
 
 test("audit normalization accepts explicit pass aliases and rejects ambiguous status", () => {
@@ -483,10 +532,13 @@ test("pending RISK requires exact phrase and consumes matching authority before 
 	const root = mkdtempSync(join(tmpdir(), "pi-goal-risk-"));
 	try {
 		const harness = makeHarness(root);
-		injectRunning(harness);
+		const initial = injectRunning(harness);
 		await harness.emit("session_start", { type: "session_start", reason: "resume" });
 		const input = { name: "external" };
 		assert.equal((await harness.emit("tool_call", { type: "tool_call", toolName: "records_create", toolCallId: "risk-1", input })).find(Boolean).block, true);
+		await harness.emit("tool_call", { type: "tool_call", toolName: "read", toolCallId: "risk-read", input: { path: "README.md" } });
+		await harness.emit("tool_result", { type: "tool_result", toolName: "read", toolCallId: "risk-read", input: { path: "README.md" }, isError: false, content: [], details: {} });
+		await harness.tool("pi_goal_request_interrupt", { goalId: initial.goalId, generation: initial.generation, class: "RISK", message: "External creation is necessary", attempts: ["Inspected local alternative"], need: "Exact creation approval", recommendation: "Approve once" });
 		await harness.emit("input", { type: "input", source: "interactive", text: "approve it" });
 		assert.equal(latestState(harness).authorities.length, 0);
 		assert.match(harness.notifications.at(-1).message, /Exact approval required/);

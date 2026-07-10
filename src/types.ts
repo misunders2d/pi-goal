@@ -130,6 +130,19 @@ export interface BackgroundWork {
 	updatedAt: string;
 }
 
+export interface PendingRiskAction {
+	toolName: string;
+	inputHash: string;
+	label: string;
+	actionClass?: ActionClass;
+}
+
+export interface DeferredRiskAction extends PendingRiskAction {
+	denials: number;
+	alternativeToolCallIds: string[];
+	createdAt: string;
+}
+
 export interface GoalInterrupt {
 	class: InterruptClass;
 	message: string;
@@ -138,12 +151,7 @@ export interface GoalInterrupt {
 	recommendation: string;
 	signature: string;
 	createdAt: string;
-	pendingAction?: {
-		toolName: string;
-		inputHash: string;
-		label: string;
-		actionClass?: ActionClass;
-	};
+	pendingAction?: PendingRiskAction;
 }
 
 export interface GoalAmendment {
@@ -204,6 +212,7 @@ export interface GoalState {
 	evaluatorReports: EvaluatorReport[];
 	auditReports: AuditReport[];
 	interrupt?: GoalInterrupt;
+	deferredRisk?: DeferredRiskAction;
 	currentAction: string;
 	nextAction: string;
 	lastEvaluatorReason?: string;

@@ -19,19 +19,19 @@ Goal mode never weakens Pi's existing permission or confirmation gates. Workspac
 ## Install
 
 ```bash
-pi install npm:@misunders2d/pi-goal@1.0.1
+pi install npm:@misunders2d/pi-goal@1.0.2
 ```
 
 Try without installing:
 
 ```bash
-pi -e npm:@misunders2d/pi-goal@1.0.0
+pi -e npm:@misunders2d/pi-goal@1.0.2
 ```
 
 Pinned GitHub release:
 
 ```bash
-pi install git:github.com/misunders2d/pi-goal@v1.0.1
+pi install git:github.com/misunders2d/pi-goal@v1.0.2
 ```
 
 ## Use
@@ -50,7 +50,7 @@ Then:
 
 Pi immediately shows a persistent planning indicator while it designs the contract; this usually takes 15–30 seconds. Review the generated outcome, done conditions, phases, verification checks, authority envelope, and interruption rules. Approve once. Bare `/goal` opens the full progress and control overlay.
 
-Natural-language messages steer an active goal. The overlay provides pause, resume, cancel, blocker resolution, and exact pending-risk approval. In normal input, approve a displayed pending action only with `approve exact pending risk once`; broader approval wording does not grant authority.
+Natural-language messages steer an active goal. The overlay provides pause, resume, cancel, blocker resolution, and exact pending-risk approval. A denied optional action is blocked internally while goal mode tries a safe alternative; it does not interrupt you merely because the worker chose a bad tool shape. A genuine RISK requires an exact blocked action plus evidence of a safe alternative attempt. In the overlay, `A` approves only that displayed action once, while `R` rejects or redirects it. In normal input, approve a displayed pending action only with `approve exact pending risk once`; broader approval wording does not grant authority.
 
 ## Deliberate boundary
 
@@ -64,6 +64,7 @@ This package is an interactive TUI product. Print (`-p`), JSON, and RPC modes ca
 - Durable evidence stores metadata, hashes, statuses, and sanitized summaries—not raw tool output, environment values, credentials, tokens, private keys, or auth-file contents.
 - The final auditor runs in an isolated in-memory Pi session with no extensions, skills, prompt templates, context files, worker transcript, or mutation tools.
 - Verification commands are approved during setup and executed later by check ID without a shell.
+- Setup rejects development-only npm checks against production packages beneath `node_modules`; installed-artifact checks must use shipped files or dependency-free runtime checks.
 
 ## Migrating from another `/goal`
 

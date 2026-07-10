@@ -11,7 +11,6 @@ import {
 import { Type } from "typebox";
 import { IsolatedModelRunner } from "./evaluator.ts";
 import {
-	canonicalTargetSummary,
 	classifyToolCall,
 	extractPaths,
 	toolDeclaresBackground,
@@ -134,6 +133,7 @@ Rules:
 - Use pi_goal_record_evidence after successful work. Omit internal node, criterion, and tool-call IDs when one current step exists; the tool infers them. Narrative alone is not proof.
 - Use pi_goal_apply_steering only for a real unconsumed user steering ID.
 - Use pi_goal_request_interrupt only for CREDENTIAL, DECISION, RISK, or a BLOCKER that survived bounded recovery.
+- A blocked or denied action is not automatically a user-facing RISK. Abandon optional denied actions and try safe in-envelope alternatives. Request RISK only when the exact blocked action is necessary to the approved outcome and safe alternatives have been attempted.
 - Use pi_goal_submit_completion_candidate only when every criterion has linked evidence and approved checks should pass.
 - Prefer typed tools and approved final checks. Avoid ad-hoc complex shell verification with separators, redirects, substitutions, or non-read-only pipelines; after a recoverable denial, use read/grep/ls or submit the completion candidate instead of interrupting the user.
 - If an approved mechanical check fails, repair only the cited setup-approved check semantics. Do not guess unrelated commands, package scripts, or files.
@@ -543,6 +543,15 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 					state.repeatedBlockers[signature] = (state.repeatedBlockers[signature] ?? 0) + 1;
 					if (state.repeatedBlockers[signature] >= 3) openInterrupt(state, requested);
 					else { state.phase = "recovering"; state.nextAction = "Try a materially different recovery path before declaring BLOCKER"; }
+				} else if (requested.class === "RISK") {
+					const candidate = state.deferredRisk;
+					if (candidate?.alternativeToolCallIds.length) {
+						openInterrupt(state, { ...requested, pendingAction: { toolName: candidate.toolName, inputHash: candidate.inputHash, label: candidate.label, actionClass: candidate.actionClass } });
+						state.deferredRisk = undefined;
+					} else {
+						state.phase = "recovering";
+						state.nextAction = "Try a safe alternative before requesting user approval for the blocked action";
+					}
 				} else openInterrupt(state, requested);
 			} else if (decision.action === "complete_candidate" && state.completionCandidate) {
 				auditRequested = true;
@@ -714,7 +723,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			if (!observations.length || observations.some((item) => !item || item.isError)) throw new Error("No recent unused successful tool observations are available for evidence");
 			const cleaned = redactText(params.summary, 500);
 			const evidence: EvidenceRecord = { id: makeId("evidence"), kind: params.kind === "test_result" ? "test_result" : "tool_result", summary: cleaned.text, criterionIds, nodeId: node?.id, toolCallId: observations.map((item) => item!.toolCallId).join(","), toolName: observations.map((item) => item!.toolName).join(","), paths: [...new Set(observations.flatMap((item) => item!.paths))], isError: false, redacted: cleaned.redacted, createdAt: now() };
-			state.evidence.push(evidence); state.repeatedToolCalls = {}; state.noProgressCount = 0;
+			state.evidence.push(evidence); state.repeatedToolCalls = {}; state.noProgressCount = 0; state.deferredRisk = undefined;
 			if (node) {
 				node.evidenceIds.push(evidence.id); node.status = "done"; node.updatedAt = now();
 				const next = state.plan.find((item) => item.status === "pending" && pendingDependencies(state, item).length === 0); if (next) next.status = "in_progress";
@@ -754,12 +763,18 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		parameters: Type.Object({ ...Expected, class: Type.Union([Type.Literal("CREDENTIAL"), Type.Literal("DECISION"), Type.Literal("RISK"), Type.Literal("BLOCKER")]), message: Type.String(), attempts: Type.Array(Type.String()), need: Type.String(), recommendation: Type.String() }),
 		execute: async (_id, params, _signal, _update, ctx) => mutex.run(() => {
 			const state = load(ctx); if (!state || state.status !== "running") throw new Error("No running goal"); validGeneration(state, params.goalId, params.generation);
-			const request = { class: params.class as InterruptClass, message: params.message, attempts: params.attempts, need: params.need, recommendation: params.recommendation };
+			const request: Omit<GoalInterrupt, "createdAt" | "signature"> = { class: params.class as InterruptClass, message: params.message, attempts: params.attempts, need: params.need, recommendation: params.recommendation };
 			if (request.class === "BLOCKER") {
 				const signature = interruptSignature(request); state.repeatedBlockers[signature] = (state.repeatedBlockers[signature] ?? 0) + 1;
 				if (state.repeatedBlockers[signature] < 3) throw new Error("BLOCKER requires three repeated evidence-backed encounters. Recover or replan first.");
 			}
-			openInterrupt(state, request); persist(ctx, "interrupt_opened", `${request.class}: ${request.message}`); return toolResult(`${request.class} interruption opened.`);
+			if (request.class === "RISK") {
+				const candidate = state.deferredRisk;
+				if (!candidate) throw new Error("RISK requires an exact action previously blocked by goal safety.");
+				if (!candidate.alternativeToolCallIds.length) throw new Error("RISK requires evidence of at least one safe alternative attempt after the blocked action.");
+				request.pendingAction = { toolName: candidate.toolName, inputHash: candidate.inputHash, label: candidate.label, actionClass: candidate.actionClass };
+			}
+			openInterrupt(state, request); state.deferredRisk = undefined; persist(ctx, "interrupt_opened", `${request.class}: ${request.message}`); return toolResult(`${request.class} interruption opened.`);
 		}),
 	});
 
@@ -871,10 +886,20 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				return { block: true, reason: `Goal recoverable denial: ${safeReason}. ${state.nextAction}` };
 			}
 			const credentialBoundary = /\b(secret|credential|password|token|private key|auth)\b/i.test(safeReason);
-			openInterrupt(state, credentialBoundary
-				? { class: "CREDENTIAL", message: safeReason, attempts: ["Goal mode refused to persist or forward secret-like input."], need: "Complete the login or credential step through the tool's secure human-controlled flow.", recommendation: "Resolve access without pasting a secret into goal state, then resume." }
-				: { class: "RISK", message: safeReason, attempts: [canonicalTargetSummary(event.input)], need: "Explicit approval for this exact action, or a safer in-envelope approach.", recommendation: "Open bare /goal to inspect and approve the exact action once.", pendingAction: { toolName: event.toolName, inputHash: hash, label: `${event.toolName}: ${safeReason}`, actionClass: decision.actionClass } });
-			persist(ctx, "risk_interrupted", `${event.toolName} outside typed authority`); return { block: true, reason: `Goal RISK: ${safeReason}` };
+			if (credentialBoundary) {
+				openInterrupt(state, { class: "CREDENTIAL", message: safeReason, attempts: ["Goal mode refused to persist or forward secret-like input."], need: "Complete the login or credential step through the tool's secure human-controlled flow.", recommendation: "Resolve access without pasting a secret into goal state, then resume." });
+				persist(ctx, "credential_interrupted", `${event.toolName} reached credential boundary`);
+				return { block: true, reason: `Goal CREDENTIAL: ${safeReason}` };
+			}
+			const existing = state.deferredRisk;
+			state.deferredRisk = existing?.toolName === event.toolName && existing.inputHash === hash
+				? { ...existing, denials: existing.denials + 1 }
+				: { toolName: event.toolName, inputHash: hash, label: `${event.toolName}: ${safeReason}`, actionClass: decision.actionClass, denials: 1, alternativeToolCallIds: [], createdAt: now() };
+			state.phase = "recovering";
+			state.currentAction = "Recovering from blocked unapproved action";
+			state.nextAction = "Abandon this action and try a safe in-envelope alternative";
+			persist(ctx, "tool_hard_denied", `${event.toolName}: ${safeReason}`);
+			return { block: true, reason: `Goal blocked unapproved action: ${safeReason}. Continue with a safe alternative; request RISK only if this exact action is necessary after alternative attempts.` };
 		}
 		if (decision.authorityId) {
 			const authority = state.authorities.find((item) => item.id === decision.authorityId);
@@ -891,7 +916,11 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		const state = load(ctx); if (!isActiveGoal(state) || GOAL_TOOL_NAMES.has(event.toolName)) return;
 		delete state.activeToolCalls[event.toolCallId];
 		const paths = extractPaths(event.input).map((path) => safeEvidencePath(state.cwd, path));
-		state.observations.push({ toolCallId: event.toolCallId, toolName: event.toolName, inputHash: inputHash(event.toolName, event.input), isError: event.isError, exitCode: toolExitCode(event), paths, createdAt: now() });
+		const observedHash = inputHash(event.toolName, event.input);
+		state.observations.push({ toolCallId: event.toolCallId, toolName: event.toolName, inputHash: observedHash, isError: event.isError, exitCode: toolExitCode(event), paths, createdAt: now() });
+		if (!event.isError && state.deferredRisk && observedHash !== state.deferredRisk.inputHash && !state.deferredRisk.alternativeToolCallIds.includes(event.toolCallId)) {
+			state.deferredRisk.alternativeToolCallIds.push(event.toolCallId);
+		}
 		const background = findBackgroundMetadata(event.details);
 		const declaresBackground = toolDeclaresBackground(toolInfo.get(event.toolName));
 		if (background.id && ((background.state && ACTIVE_STATES.has(background.state)) || (!background.state && declaresBackground))) state.backgroundWork[background.id] = { id: background.id, label: redactText(background.label ?? event.toolName, 200).text, toolName: event.toolName, startedAt: now(), updatedAt: now() };

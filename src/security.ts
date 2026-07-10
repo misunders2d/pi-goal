@@ -113,6 +113,10 @@ const ALWAYS_RISKY = new Set([
 
 const READ_ONLY_PIPE_COMMANDS = new Set(["cat", "cut", "fd", "file", "find", "grep", "head", "ls", "pwd", "rg", "sed", "sort", "stat", "tail", "tr", "uniq", "wc"]);
 
+function isExactReadOnlySystemctl(tokens: string[]): boolean {
+	return tokens.length === 2 && tokens[0] === "systemctl" && tokens[1] === "--failed";
+}
+
 export function isGoalPrivatePath(cwd: string, agentDir: string | undefined, candidate: string): boolean {
 	if (!agentDir) return false;
 	const root = resolve(agentDir, "pi-goal");
@@ -140,6 +144,7 @@ function obviousHardCommandRisk(command: string, cwd: string): string | undefine
 		const tokens = shellTokens(clause);
 		if (!tokens?.length) continue;
 		const executable = tokens[0]!;
+		if (isExactReadOnlySystemctl(tokens)) continue;
 		if (ALWAYS_RISKY.has(executable)) return `${executable} changes privileged, service, infrastructure, or remote state`;
 		if (["bash", "sh", "zsh", "fish"].includes(executable)) return "nested shell execution requires typed authority";
 		if (executable === "rm") return "file deletion requires typed authority";
@@ -178,6 +183,7 @@ function commandRisk(command: string, cwd: string, agentDir?: string): { risky: 
 		if (tokens.some(isSensitivePath)) return { risky: true, reason: "secret/auth/key paths are outside goal evidence authority", recoverable: true };
 		if (tokens.some((token) => isGoalPrivatePath(cwd, agentDir, token))) return { risky: true, reason: "goal-private state is not worker-readable", recoverable: true };
 		const executable = tokens[0]!;
+		if (isExactReadOnlySystemctl(tokens)) continue;
 		if (executable === "cd") {
 			const target = tokens[1];
 			if (tokens.length !== 2 || !target || !isWithinWorkspace(cwd, target)) return { risky: true, reason: "cd target leaves the approved workspace", recoverable: true };

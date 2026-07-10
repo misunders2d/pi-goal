@@ -46,10 +46,13 @@ test("panel layout fits narrow terminals and avoids unnecessary wide scrolling",
 test("detail content surfaces interruption attempts, need, and recommendation", () => {
 	const goal = state();
 	goal.status = "interrupted";
-	goal.interrupt = { class: "RISK", message: "External write needed", attempts: ["Tried local path"], need: "Approval", recommendation: "Approve once", signature: "x", createdAt: new Date().toISOString() };
+	goal.interrupt = { class: "RISK", message: "External write needed", attempts: ["Tried local path"], need: "Approval", recommendation: "Approve once", signature: "x", createdAt: new Date().toISOString(), pendingAction: { toolName: "publish", inputHash: "hash", label: "Publish once" } };
 	const text = detailContent(goal, 80).join("\n");
 	assert.match(text, /RISK interruption/);
 	assert.match(text, /Tried:/);
 	assert.match(text, /Need:/);
 	assert.match(text, /Recommendation:/);
+	assert.match(text, /A approve only the displayed pending action once/);
+	assert.match(text, /not a general resume/);
+	assert.match(text, /R reject or redirect/);
 });
