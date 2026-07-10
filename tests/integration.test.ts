@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { IsolatedModelRunner, SETUP_PLANNER_SYSTEM_PROMPT, normalizeAuditDecision, normalizeDraft, normalizePlanningResult } from "../src/evaluator.ts";
-import piGoalExtension, { isInformationalGoalInput, validateAuditCompletion } from "../src/index.ts";
+import piGoalExtension, { isInformationalGoalInput, validateAuditCompletion, verificationRecoveryWindow } from "../src/index.ts";
 import { STATE_CUSTOM_TYPE, createGoalState, sha256 } from "../src/state.ts";
 import type { GoalDraft } from "../src/types.ts";
 
@@ -123,6 +123,21 @@ test("planner requests clarification without workspace tools", async () => {
 	assert.match(options.systemPrompt, /Never infer unclear intent by inspecting the workspace/);
 });
 
+test("planner clarifies explicitly contradictory requirements without tools", async () => {
+	const runner = new IsolatedModelRunner("/tmp/pi-goal-test-agent");
+	const input = "Create conflict.txt; the final file must both exist with READY content and not exist.";
+	let options: any;
+	(runner as any).run = async (value: any) => {
+		options = value;
+		assert.equal(JSON.parse(value.prompt).userOutcome, input);
+		return JSON.stringify({ status: "needs_clarification", questions: ["Should conflict.txt exist with READY content, or should its final state be absent?"] });
+	};
+	const result = await runner.plan({ cwd: "/tmp/workspace" } as any, input, [{ name: "read", description: "Read file", parameters: {} } as any]);
+	assert.deepEqual(result, { kind: "clarification", questions: ["Should conflict.txt exist with READY content, or should its final state be absent?"] });
+	assert.deepEqual(options.tools, []);
+	assert.match(options.systemPrompt, /If multiple materially different contracts are plausible/);
+});
+
 test("planning result is fail-closed and accepts only clarification or a complete ready contract", () => {
 	assert.deepEqual(
 		normalizePlanningResult({ status: "needs_clarification", questions: ["Target?", "Scope?", "Success condition?", "Extra?"] }, "Do work"),
@@ -198,19 +213,40 @@ test("complex verification shell soft-denies without user interruption", async (
 		injectRunning(harness);
 		await harness.emit("session_start", { type: "session_start", reason: "resume" });
 		const messagesBefore = harness.messages.length;
+		const currentActionBefore = latestState(harness).currentAction;
 		const command = "test -f READY.md && printf 'exists '; wc -c < READY.md && grep -qx 'READY' READY.md";
 		const blocked = (await harness.emit("tool_call", { type: "tool_call", toolName: "bash", toolCallId: "b1", input: { command } })).find(Boolean);
 		assert.equal(blocked.block, true);
 		assert.match(blocked.reason, /Goal recoverable denial/);
 		const persisted = latestState(harness);
 		assert.equal(persisted.status, "running");
-		assert.equal(persisted.phase, "recovering");
+		assert.equal(persisted.phase, "executing");
+		assert.equal(persisted.currentAction, currentActionBefore);
 		assert.equal(persisted.interrupt, undefined);
-		assert.match(persisted.nextAction, /read, grep, ls|approved verification/);
 		assert.equal(harness.messages.length, messagesBefore);
+		await harness.emit("tool_result", { type: "tool_result", toolName: "read", toolCallId: "safe-read", input: { path: "READY.md" }, isError: false, content: [], details: {} });
+		await harness.tool("pi_goal_record_evidence", { goalId: persisted.goalId, generation: persisted.generation, summary: "safe typed fallback succeeded", criterionIds: ["AC1"] });
+		assert.equal(latestState(harness).phase, "executing");
+		assert.equal(latestState(harness).plan[0].status, "done");
 		const events = readFileSync(goalArtifact(root, "events.jsonl"), "utf8");
 		assert.match(events, /tool_soft_denied/);
 		assert.doesNotMatch(events, /printf 'exists '/);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("accepted evidence reconciles a stale non-verification recovery phase", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root);
+		const state = injectRunning(harness);
+		state.phase = "recovering";
+		state.currentAction = "Recovering from refused tool shape";
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		await harness.emit("tool_result", { type: "tool_result", toolName: "read", toolCallId: "safe-read", input: { path: "READY.md" }, isError: false, content: [], details: {} });
+		await harness.tool("pi_goal_record_evidence", { goalId: state.goalId, generation: state.generation, summary: "safe progress", criterionIds: ["AC1"] });
+		const persisted = latestState(harness);
+		assert.equal(persisted.phase, "executing");
+		assert.equal(persisted.plan[0].status, "done");
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -403,6 +439,14 @@ test("informational goal questions do not mutate generation or become steering",
 		assert.equal(persisted.generation, initial.generation);
 		assert.equal(persisted.outcome.amendments.length, 0);
 	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("verification recovery timeout boundary is deterministic without wall-clock waiting", () => {
+	const started = "2026-07-10T00:00:00.000Z";
+	const startMs = Date.parse(started);
+	assert.deepEqual(verificationRecoveryWindow(started, startMs + 599_999), { elapsedMs: 599_999, timedOut: false });
+	assert.deepEqual(verificationRecoveryWindow(started, startMs + 600_000), { elapsedMs: 600_000, timedOut: true });
+	assert.deepEqual(verificationRecoveryWindow(undefined, startMs + 600_000), { elapsedMs: 0, timedOut: false });
 });
 
 test("stale internal tool generations fail and user steering increments generation", async () => {
@@ -667,6 +711,34 @@ test("pause, steering, resume, and cancellation invalidate queued work", async (
 		assert.equal(latestState(harness).status, "cancelled");
 		assert.equal(harness.aborts, 2);
 		assert.equal((await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "x" })).find(Boolean), undefined);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("BLOCKER opens on the third durable identical encounter", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-blocker-"));
+	try {
+		const harness = makeHarness(root);
+		const state = injectRunning(harness);
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		const request = {
+			goalId: state.goalId,
+			generation: state.generation,
+			class: "BLOCKER",
+			message: "Immutable approved check cannot execute",
+			attempts: ["Validated the same deterministic contract defect"],
+			need: "A new valid contract",
+			recommendation: "Cancel and recreate after fixing setup validation",
+		};
+		await assert.rejects(() => harness.tool("pi_goal_request_interrupt", request), /requires three repeated/);
+		await assert.rejects(() => harness.tool("pi_goal_request_interrupt", request), /requires three repeated/);
+		const opened = await harness.tool("pi_goal_request_interrupt", request);
+		assert.match(opened.content[0].text, /BLOCKER interruption opened/);
+		const persisted = latestState(harness);
+		assert.equal(persisted.status, "interrupted");
+		assert.equal(persisted.phase, "blocked");
+		assert.equal(persisted.interrupt.class, "BLOCKER");
+		const events = readFileSync(goalArtifact(root, "events.jsonl"), "utf8");
+		assert.equal((events.match(/blocker_encounter/g) ?? []).length, 2);
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 

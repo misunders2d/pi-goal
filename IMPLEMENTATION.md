@@ -10,6 +10,8 @@ This package ships only when the complete product contract is satisfied.
 - [x] Full-idle, background-work, stale continuation, and doom-loop guards
 - [x] Criterion-specific metadata-only evidence with secret redaction
 - [x] Shared setup/runtime check validation, completion preflight targets, and exceptional-only bounded recovery
+- [x] Optional tool-shape denials preserve execution phase; accepted evidence reconciles stale non-verification recovery
+- [x] Durable three-encounter BLOCKER escalation and injectable verification-watchdog boundary tests
 - [x] Isolated evaluator and independent final auditor
 - [x] Pause, resume, cancel, and four actionable interrupt classes
 - [x] Unit, integration, persistence, safety, audit, and TUI rendering tests

@@ -7,7 +7,7 @@ A fire-and-forget goal mode for [Pi](https://pi.dev): describe an outcome, appro
 - One `/goal <outcome>` setup and approval.
 - Autonomous continuation until verified complete or genuinely blocked.
 - Compact live progress plus a detailed `/goal` overlay.
-- Natural-language steering while work is active.
+- Natural-language directions steer work; informational questions do not mutate the goal.
 - Durable state across compaction, reload, and session resume.
 - Bounded recovery, stale-turn protection, and doom-loop detection.
 - Evidence-backed completion through a constrained verifier and isolated auditor.
@@ -19,19 +19,19 @@ Goal mode never weakens Pi's existing permission or confirmation gates. Workspac
 ## Install
 
 ```bash
-pi install npm:@misunders2d/pi-goal@1.0.5
+pi install npm:@misunders2d/pi-goal@1.0.6
 ```
 
 Try without installing:
 
 ```bash
-pi -e npm:@misunders2d/pi-goal@1.0.5
+pi -e npm:@misunders2d/pi-goal@1.0.6
 ```
 
 Pinned GitHub release:
 
 ```bash
-pi install git:github.com/misunders2d/pi-goal@v1.0.5
+pi install git:github.com/misunders2d/pi-goal@v1.0.6
 ```
 
 ## Use
@@ -50,7 +50,7 @@ Then:
 
 Pi immediately shows a persistent setup indicator while it checks whether the requested target, scope, outcome, and success conditions are clear. If anything material is ambiguous, goal mode asks concise clarification questions before creating or persisting a contract. The setup planner cannot inspect the workspace or use tools to guess intent. Once the request is clear, review the generated outcome, done conditions, phases, verification checks, authority envelope, and interruption rules. Approve once. Bare `/goal` opens the full progress and control overlay.
 
-Natural-language directions steer an active goal, while informational questions such as status or recovery explanations do not mutate the contract or generation. The overlay provides pause, resume, cancel, blocker resolution, and exact pending-risk approval. Setup validates every proposed verification check with the same structural rules used at runtime, so deterministic contract defects are rejected before approval. Completion preflight failures remain in execution; `recovering` is reserved for unexpected post-preflight divergence. Multi-criterion steps require criterion-specific evidence and remain active until every mapped criterion is covered. Approved failures expose sanitized targets immediately; an identical runtime failure opens `BLOCKER`, and runtime verification recovery is capped at ten minutes. A denied optional action is blocked internally while goal mode tries a safe alternative; it does not interrupt you merely because the worker chose a bad tool shape. A genuine RISK requires an exact blocked action plus evidence of a safe alternative attempt. In the overlay, `A` approves only that displayed action once, while `R` rejects or redirects it. In normal input, approve a displayed pending action only with `approve exact pending risk once`; broader approval wording does not grant authority.
+Natural-language directions steer an active goal, while informational questions such as status or recovery explanations do not mutate the contract or generation. The overlay provides pause, resume, cancel, blocker resolution, and exact pending-risk approval. Setup validates every proposed verification check with the same structural rules used at runtime, so deterministic contract defects are rejected before approval. Completion preflight failures remain in execution; `recovering` is reserved for unexpected runtime divergence and bounded no-progress loops. Multi-criterion steps require criterion-specific evidence and remain active until every mapped criterion is covered. Approved failures expose sanitized targets immediately; an identical runtime failure opens `BLOCKER`, and runtime verification recovery is capped at ten minutes. A recoverable optional tool-shape denial is recorded and blocked without changing the lifecycle phase; a safe typed fallback can continue ordinary execution. Accepted evidence also reconciles stale non-verification recovery state from older sessions. A genuine RISK requires an exact blocked action plus evidence of a safe alternative attempt. In the overlay, `A` approves only that displayed action once, while `R` rejects or redirects it. In normal input, approve a displayed pending action only with `approve exact pending risk once`; broader approval wording does not grant authority.
 
 ## Deliberate boundary
 

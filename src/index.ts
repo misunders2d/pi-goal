@@ -62,6 +62,12 @@ const CONTINUATION_CUSTOM_TYPE = "pi-goal-continuation-v1";
 const MAX_IDENTICAL_VERIFICATION_FAILURES = 2;
 const MAX_VERIFICATION_RECOVERY_MS = 10 * 60 * 1_000;
 
+export function verificationRecoveryWindow(startedAt: string | undefined, atMs = Date.now(), maxMs = MAX_VERIFICATION_RECOVERY_MS): { elapsedMs: number; timedOut: boolean } {
+	const started = Date.parse(startedAt ?? "");
+	const elapsedMs = Number.isFinite(started) ? Math.max(0, atMs - started) : 0;
+	return { elapsedMs, timedOut: elapsedMs >= maxMs };
+}
+
 export function isInformationalGoalInput(text: string): boolean {
 	const normalized = text.trim();
 	if (!normalized) return false;
@@ -367,11 +373,10 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			state.verificationFailureCount = 1;
 			state.verificationRecoveryStartedAt = at;
 		}
-		const started = Date.parse(state.verificationRecoveryStartedAt ?? at);
-		const elapsedMs = Number.isFinite(started) ? Math.max(0, Date.now() - started) : 0;
+		const window = verificationRecoveryWindow(state.verificationRecoveryStartedAt);
 		return {
-			blocked: state.verificationFailureCount >= MAX_IDENTICAL_VERIFICATION_FAILURES || elapsedMs >= MAX_VERIFICATION_RECOVERY_MS,
-			elapsedMs,
+			blocked: state.verificationFailureCount >= MAX_IDENTICAL_VERIFICATION_FAILURES || window.timedOut,
+			elapsedMs: window.elapsedMs,
 		};
 	}
 
@@ -858,6 +863,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			const cleaned = redactText(params.summary, 500);
 			const evidence: EvidenceRecord = { id: makeId("evidence"), kind: params.kind === "test_result" ? "test_result" : "tool_result", summary: cleaned.text, criterionIds, nodeId: node?.id, toolCallId: observations.map((item) => item!.toolCallId).join(","), toolName: observations.map((item) => item!.toolName).join(","), paths: [...new Set(observations.flatMap((item) => item!.paths))], isError: false, redacted: cleaned.redacted, createdAt: now() };
 			state.evidence.push(evidence); state.repeatedToolCalls = {}; state.noProgressCount = 0; state.deferredRisk = undefined;
+			if (state.phase === "recovering" && !state.interrupt && !state.verificationFailureSignature) state.phase = "executing";
 			if (node) {
 				node.evidenceIds.push(evidence.id); node.updatedAt = now();
 				const covered = new Set(state.evidence.flatMap((item) => item.criterionIds));
@@ -909,7 +915,10 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			const request: Omit<GoalInterrupt, "createdAt" | "signature"> = { class: params.class as InterruptClass, message: params.message, attempts: params.attempts, need: params.need, recommendation: params.recommendation };
 			if (request.class === "BLOCKER") {
 				const signature = interruptSignature(request); state.repeatedBlockers[signature] = (state.repeatedBlockers[signature] ?? 0) + 1;
-				if (state.repeatedBlockers[signature] < 3) throw new Error("BLOCKER requires three repeated evidence-backed encounters. Recover or replan first.");
+				if (state.repeatedBlockers[signature] < 3) {
+					persist(ctx, "blocker_encounter", `BLOCKER encounter ${state.repeatedBlockers[signature]} of 3: ${request.message}`);
+					throw new Error("BLOCKER requires three repeated evidence-backed encounters. Recover or replan first.");
+				}
 			}
 			if (request.class === "RISK") {
 				const candidate = state.deferredRisk;
@@ -1066,11 +1075,9 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		if (!decision.allow) {
 			const safeReason = redactText(decision.reason ?? "outside approved authority", 300).text;
 			if (decision.recoverable) {
-				state.phase = "recovering";
-				state.currentAction = "Recovering from refused tool shape";
-				state.nextAction = recoverableDenialGuidance(event.toolName);
+				const guidance = recoverableDenialGuidance(event.toolName);
 				persist(ctx, "tool_soft_denied", `${event.toolName}: ${safeReason}`);
-				return { block: true, reason: `Goal recoverable denial: ${safeReason}. ${state.nextAction}` };
+				return { block: true, reason: `Goal recoverable denial: ${safeReason}. ${guidance}` };
 			}
 			const credentialBoundary = /\b(secret|credential|password|token|private key|auth)\b/i.test(safeReason);
 			if (credentialBoundary) {
