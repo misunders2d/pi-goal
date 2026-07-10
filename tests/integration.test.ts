@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { IsolatedModelRunner, SETUP_PLANNER_SYSTEM_PROMPT, normalizeAuditDecision, normalizeDraft, normalizePlanningResult } from "../src/evaluator.ts";
-import piGoalExtension, { validateAuditCompletion } from "../src/index.ts";
+import piGoalExtension, { isInformationalGoalInput, validateAuditCompletion } from "../src/index.ts";
 import { STATE_CUSTOM_TYPE, createGoalState, sha256 } from "../src/state.ts";
 import type { GoalDraft } from "../src/types.ts";
 
@@ -343,7 +343,7 @@ test("mechanical failure cites approved check and does not invoke auditor", asyn
 		assert.equal(auditCalled, false);
 		assert.equal(persisted.status, "running");
 		assert.equal(persisted.phase, "recovering");
-		assert.equal(persisted.currentAction, "Repairing failed verification");
+		assert.equal(persisted.currentAction, "Repairing unexpected verification failure");
 		assert.match(persisted.nextAction, /setup-approved check V2 "READY\.md content is exactly READY"/);
 		assert.match(persisted.nextAction, /executable="node" cwd="\." argv=/);
 		assert.equal(persisted.verificationFailureCount, 1);
@@ -368,6 +368,41 @@ test("mechanical failure cites approved check and does not invoke auditor", asyn
 		IsolatedModelRunner.prototype.audit = originalAudit;
 		rmSync(root, { recursive: true, force: true });
 	}
+});
+
+test("completion preflight defects stay in execution instead of normalizing recovery", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-preflight-"));
+	try {
+		const harness = makeHarness(root);
+		mkdirSync(harness.ctx.cwd, { recursive: true });
+		const initial = injectRunning(harness);
+		initial.evidence.push({ id: "e1", kind: "tool_result", summary: "attempted", criterionIds: ["AC1"], nodeId: "P1", paths: [], createdAt: new Date().toISOString() });
+		initial.plan[0].evidenceIds.push("e1"); initial.plan[0].status = "done";
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		const result = await harness.tool("pi_goal_submit_completion_candidate", { goalId: initial.goalId, generation: initial.generation, summary: "premature" });
+		assert.match(result.content[0].text, /Completion candidate rejected/);
+		const persisted = latestState(harness);
+		assert.equal(persisted.status, "running");
+		assert.equal(persisted.phase, "executing");
+		assert.equal(persisted.currentAction, "Completion preflight rejected");
+		assert.equal(persisted.auditFailureCount, 0);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("informational goal questions do not mutate generation or become steering", async () => {
+	assert.equal(isInformationalGoalInput('why is it "recovering" again?'), true);
+	assert.equal(isInformationalGoalInput("what is the goal status?"), true);
+	assert.equal(isInformationalGoalInput("Also verify documentation"), false);
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root);
+		const initial = injectRunning(harness);
+		const results = await harness.emit("input", { type: "input", source: "interactive", text: 'why is it "recovering" again?' });
+		assert.equal(results.find(Boolean), undefined);
+		const persisted = latestState(harness);
+		assert.equal(persisted.generation, initial.generation);
+		assert.equal(persisted.outcome.amendments.length, 0);
+	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("stale internal tool generations fail and user steering increments generation", async () => {
@@ -399,6 +434,29 @@ test("evidence links recent successful observations without exposing tool-call I
 		assert.deepEqual(persisted.evidence[0].criterionIds, ["AC1"]);
 		assert.equal(persisted.evidence[0].nodeId, "P1");
 		assert.equal(persisted.plan[0].status, "done");
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("multi-criterion nodes require specific evidence and remain active until all criteria are covered", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root);
+		const multi = createGoalState({
+			outcome: "Prove two outcomes",
+			criteria: ["First result", "Second result"],
+			phases: [{ id: "P1", title: "Prove both", criterionIds: ["AC1", "AC2"] }],
+			verificationChecks: [{ id: "V1", kind: "file_exists", label: "manifest", path: "package.json" }],
+			authorities: [], constraints: [], nonGoals: [],
+		}, harness.ctx);
+		multi.status = "running"; multi.phase = "executing"; harness.branch.push({ type: "custom", customType: STATE_CUSTOM_TYPE, data: multi });
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		await harness.emit("tool_result", { type: "tool_result", toolName: "read", toolCallId: "r1", input: { path: "one.md" }, isError: false, content: [], details: {} });
+		await assert.rejects(() => harness.tool("pi_goal_record_evidence", { goalId: multi.goalId, generation: multi.generation, summary: "ambiguous" }), /maps multiple criteria/);
+		await harness.tool("pi_goal_record_evidence", { goalId: multi.goalId, generation: multi.generation, summary: "first", criterionIds: ["AC1"] });
+		assert.equal(latestState(harness).plan[0].status, "in_progress");
+		await harness.emit("tool_result", { type: "tool_result", toolName: "read", toolCallId: "r2", input: { path: "two.md" }, isError: false, content: [], details: {} });
+		await harness.tool("pi_goal_record_evidence", { goalId: multi.goalId, generation: multi.generation, summary: "second", criterionIds: ["AC2"] });
+		assert.equal(latestState(harness).plan[0].status, "done");
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -444,6 +502,11 @@ test("planner rejects development-only checks against installed packages", () =>
 		authorities: [], constraints: [], nonGoals: [],
 	};
 	assert.match(SETUP_PLANNER_SYSTEM_PROMPT, /installed packages beneath node_modules/);
+	assert.match(SETUP_PLANNER_SYSTEM_PROMPT, /never generate multiline python\/node scripts/);
+	assert.throws(() => normalizeDraft({
+		...base,
+		verificationChecks: [{ id: "V0", kind: "command_exit", label: "multiline python", executable: "python3", args: ["-c", "print('one')\nprint('two')"] }],
+	}, base.outcome, "/home/user"), /verifier-incompatible.*V0.*argv contains an invalid value/);
 	assert.throws(() => normalizeDraft({
 		...base,
 		verificationChecks: [{ id: "V1", kind: "command_exit", label: "complete package check", executable: "npm", args: ["run", "check"], cwd: "/home/user/.pi/agent/npm/node_modules/@scope/pkg" }],
@@ -514,7 +577,10 @@ test("full candidate audit normalizes pass to met and completes", async () => {
 		assert.equal(persisted.status, "completed");
 		assert.equal(persisted.criteria[0].status, "met");
 		assert.equal(persisted.auditReports.at(-1).verdict, "pass");
+		assert.equal(persisted.auditFailureCount, 0);
+		assert.equal(persisted.verificationFailureCount, 0);
 		assert.match(JSON.stringify(harness.messages), /Goal complete and independently verified/);
+		assert.doesNotMatch(readFileSync(goalArtifact(root, "events.jsonl"), "utf8"), /verification_failed|completion_preflight_failed/);
 	} finally {
 		IsolatedModelRunner.prototype.audit = originalAudit;
 		rmSync(root, { recursive: true, force: true });

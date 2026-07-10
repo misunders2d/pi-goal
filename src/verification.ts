@@ -81,17 +81,42 @@ function checkedPath(cwd: string, path: string): string {
 	return resolve(cwd, path);
 }
 
-function validateExecutable(check: Extract<VerificationCheck, { kind: "command_exit" }>, workspace: string): { executable: string; cwd: string } {
-	if (!check.executable || /[\s;&|<>`$\n\r]/.test(check.executable)) throw new Error("verification executable is invalid");
-	const basename = check.executable.split(/[\\/]/).at(-1) ?? check.executable;
-	if (DENIED_EXECUTABLES.has(basename)) throw new Error(`verification executable is denied: ${basename}`);
-	if (check.args.some((arg) => typeof arg !== "string" || /[\u0000\n\r]/.test(arg))) throw new Error("verification argv contains an invalid value");
-	if (["npm", "pnpm", "yarn"].includes(basename)) {
-		const operation = check.args[0] ?? "";
-		if (/^(?:install|i|add|publish|unpublish|deprecate|login|logout|pack|exec|explore|x|init)$/.test(operation)) throw new Error(`verification package operation is denied: ${operation}`);
-		if (operation === "run" && !/^(?:test|check|lint|build|typecheck|verify)(?::[A-Za-z0-9._-]+)?$/.test(check.args[1] ?? "")) throw new Error("verification npm script is outside the test/check/lint/build allowlist");
+export function validateVerificationCheckDefinition(check: VerificationCheck, workspace: string): void {
+	switch (check.kind) {
+		case "file_exists":
+		case "file_contains":
+		case "json_equals":
+			checkedPath(workspace, check.path);
+			if (check.kind === "file_contains" && check.regex) {
+				try { new RegExp(check.pattern, "m"); }
+				catch { throw new Error("verification regex is invalid"); }
+			}
+			if (check.kind === "json_equals" && check.pointer !== "" && !check.pointer.startsWith("/")) throw new Error("verification JSON pointer is invalid");
+			return;
+		case "command_exit": {
+			if (!check.executable || /[\s;&|<>`$\n\r]/.test(check.executable)) throw new Error("verification executable is invalid");
+			const basename = check.executable.split(/[\\/]/).at(-1) ?? check.executable;
+			if (DENIED_EXECUTABLES.has(basename)) throw new Error(`verification executable is denied: ${basename}`);
+			if (check.args.some((arg) => typeof arg !== "string" || /[\u0000\n\r]/.test(arg))) throw new Error("verification argv contains an invalid value");
+			if (["npm", "pnpm", "yarn"].includes(basename)) {
+				const operation = check.args[0] ?? "";
+				if (/^(?:install|i|add|publish|unpublish|deprecate|login|logout|pack|exec|explore|x|init)$/.test(operation)) throw new Error(`verification package operation is denied: ${operation}`);
+				if (operation === "run" && !/^(?:test|check|lint|build|typecheck|verify)(?::[A-Za-z0-9._-]+)?$/.test(check.args[1] ?? "")) throw new Error("verification npm script is outside the test/check/lint/build allowlist");
+			}
+			if (basename === "git" && !["status", "diff", "show", "log", "rev-parse", "ls-files", "grep"].includes(check.args[0] ?? "")) throw new Error("verification git operation is not read-only");
+			if (check.cwd) checkedPath(workspace, check.cwd);
+			if (isAbsolute(check.executable)) checkedPath(workspace, check.executable);
+			return;
+		}
+		case "git_status":
+			return;
+		case "git_diff":
+			for (const path of check.paths ?? []) checkedPath(workspace, path);
 	}
-	if (basename === "git" && !["status", "diff", "show", "log", "rev-parse", "ls-files", "grep"].includes(check.args[0] ?? "")) throw new Error("verification git operation is not read-only");
+}
+
+function validateExecutable(check: Extract<VerificationCheck, { kind: "command_exit" }>, workspace: string): { executable: string; cwd: string } {
+	validateVerificationCheckDefinition(check, workspace);
 	const cwd = check.cwd ? checkedPath(workspace, check.cwd) : workspace;
 	const executable = isAbsolute(check.executable) ? checkedPath(workspace, check.executable) : check.executable;
 	return { executable, cwd };

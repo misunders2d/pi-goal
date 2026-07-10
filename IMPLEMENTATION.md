@@ -4,12 +4,12 @@ This package ships only when the complete product contract is satisfied.
 
 - [x] Durable typed state, atomic mirror, compaction/reload recovery
 - [x] Isolated tool-free setup planner with clarification-before-contract and one approval card
-- [x] Natural-language steering and one active goal per session
+- [x] Natural-language steering separated from informational questions; one active goal per session
 - [x] Compact widget and responsive detail overlay
 - [x] Typed authority envelope and fail-closed generic safety
 - [x] Full-idle, background-work, stale continuation, and doom-loop guards
-- [x] Metadata-only evidence with secret redaction
-- [x] Setup-approved constrained verification checks with preflight targets and bounded recovery
+- [x] Criterion-specific metadata-only evidence with secret redaction
+- [x] Shared setup/runtime check validation, completion preflight targets, and exceptional-only bounded recovery
 - [x] Isolated evaluator and independent final auditor
 - [x] Pause, resume, cancel, and four actionable interrupt classes
 - [x] Unit, integration, persistence, safety, audit, and TUI rendering tests

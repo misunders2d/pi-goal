@@ -62,6 +62,14 @@ const CONTINUATION_CUSTOM_TYPE = "pi-goal-continuation-v1";
 const MAX_IDENTICAL_VERIFICATION_FAILURES = 2;
 const MAX_VERIFICATION_RECOVERY_MS = 10 * 60 * 1_000;
 
+export function isInformationalGoalInput(text: string): boolean {
+	const normalized = text.trim();
+	if (!normalized) return false;
+	return /^(?:why|what|how|where|when|who)\b/i.test(normalized)
+		|| /^(?:show|explain|summarize)\b.*\b(?:status|progress|goal|recovering|recovery|blocked|verification)\b/i.test(normalized)
+		|| /^(?:status|progress)(?:\s|\?|$)/i.test(normalized);
+}
+
 function textContent(text: string) {
 	return [{ type: "text" as const, text }];
 }
@@ -425,16 +433,16 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		}
 	}
 
-	function transitionVerificationFailure(ctx: ExtensionContext, state: GoalState, checks: VerificationResult[], queueContinuation: boolean): void {
+	function transitionVerificationFailure(ctx: ExtensionContext, state: GoalState, checks: VerificationResult[], mode: "preflight" | "runtime"): void {
 		const failures = checks.filter((item) => !item.passed);
 		const recovery = noteVerificationFailure(state, failures);
-		state.auditFailureCount += 1;
+		if (mode === "runtime") state.auditFailureCount += 1;
 		state.completionCandidate = false;
 		state.status = "running";
-		state.phase = "recovering";
-		state.currentAction = "Repairing failed verification";
+		state.phase = mode === "runtime" ? "recovering" : "executing";
+		state.currentAction = mode === "runtime" ? "Repairing unexpected verification failure" : "Completion preflight rejected";
 		state.nextAction = failures[0]?.summary ?? "Repair verification";
-		if (state.auditFailureCount >= 3 || recovery.blocked) {
+		if ((mode === "runtime" && state.auditFailureCount >= 3) || recovery.blocked) {
 			const elapsedMinutes = Math.max(1, Math.ceil(recovery.elapsedMs / 60_000));
 			const identicalFailure = state.verificationFailureCount >= MAX_IDENTICAL_VERIFICATION_FAILURES;
 			const timedOut = recovery.elapsedMs >= MAX_VERIFICATION_RECOVERY_MS;
@@ -450,10 +458,10 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				recommendation: "Use the displayed sanitized check target to decide whether to amend or cancel the goal.",
 			});
 		}
-		persist(ctx, "verification_failed", state.nextAction);
-		if (state.status === "running") {
+		persist(ctx, mode === "runtime" ? "verification_failed" : "completion_preflight_failed", state.nextAction);
+		if (state.status === "running" && mode === "runtime") {
 			scheduleVerificationRecoveryTimeout(ctx, state);
-			if (queueContinuation) triggerContinuation(state, "Verification failed. Repair the displayed approved check target; do not repeat the same action unchanged.");
+			triggerContinuation(state, "Unexpected verification failure. Repair the displayed approved check target; do not repeat the same action unchanged.");
 		} else clearVerificationRecoveryTimer();
 	}
 
@@ -550,7 +558,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			await mutex.run(() => {
 				const state = load(ctx);
 				if (!state || state.goalId !== goalId || state.generation !== generation || state.continuationSequence !== sequence) return;
-				transitionVerificationFailure(ctx, state, checks, true);
+				transitionVerificationFailure(ctx, state, checks, "runtime");
 			});
 			return;
 		}
@@ -824,7 +832,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "pi_goal_record_evidence",
 		label: "Record Goal Evidence",
-		description: "Link recent successful observations to the current goal step without raw output. Node, criterion, and tool-call IDs are inferred when omitted; explicit unknown IDs are rejected.",
+		description: "Link recent successful observations to specific criteria. Multi-criterion steps require explicit criterion IDs and complete only after every mapped criterion has evidence.",
 		parameters: Type.Object({ ...Expected, summary: Type.String(), toolCallIds: Type.Optional(Type.Array(Type.String(), { minItems: 1 })), criterionIds: Type.Optional(Type.Array(Type.String(), { minItems: 1 })), nodeId: Type.Optional(Type.String()), kind: Type.Optional(Type.String()) }),
 		execute: async (_id, params, _signal, _update, ctx) => mutex.run(() => {
 			const state = load(ctx); if (!state || state.status !== "running") throw new Error("No running goal"); validGeneration(state, params.goalId, params.generation);
@@ -832,6 +840,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			const node = params.nodeId ? state.plan.find((item) => item.id === params.nodeId) : currentNode(state);
 			if (params.nodeId && !node) throw new Error(`Unknown plan node: ${params.nodeId}. Valid nodes: ${state.plan.map((item) => item.id).join(", ")}`);
 			const unresolvedCriterionIds = state.criteria.filter((criterion) => criterion.status === "pending" || criterion.status === "failed").map((criterion) => criterion.id);
+			if (!params.criterionIds && node && node.criterionIds.length > 1) throw new Error(`Current node ${node.id} maps multiple criteria; specify the criterionIds this observation actually proves: ${node.criterionIds.join(", ")}`);
 			const criterionIds = params.criterionIds ? [...params.criterionIds] : node ? [...node.criterionIds] : unresolvedCriterionIds;
 			const unknownCriteria = criterionIds.filter((id) => !knownCriteria.has(id));
 			if (unknownCriteria.length) throw new Error(`Unknown criterion IDs: ${unknownCriteria.join(", ")}. Valid criteria: ${[...knownCriteria].join(", ")}`);
@@ -850,9 +859,18 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			const evidence: EvidenceRecord = { id: makeId("evidence"), kind: params.kind === "test_result" ? "test_result" : "tool_result", summary: cleaned.text, criterionIds, nodeId: node?.id, toolCallId: observations.map((item) => item!.toolCallId).join(","), toolName: observations.map((item) => item!.toolName).join(","), paths: [...new Set(observations.flatMap((item) => item!.paths))], isError: false, redacted: cleaned.redacted, createdAt: now() };
 			state.evidence.push(evidence); state.repeatedToolCalls = {}; state.noProgressCount = 0; state.deferredRisk = undefined;
 			if (node) {
-				node.evidenceIds.push(evidence.id); node.status = "done"; node.updatedAt = now();
-				const next = state.plan.find((item) => item.status === "pending" && pendingDependencies(state, item).length === 0); if (next) next.status = "in_progress";
-				state.currentAction = next?.title ?? "Verify completion"; state.nextAction = state.plan.find((item) => item.status === "pending")?.title ?? "Submit completion candidate";
+				node.evidenceIds.push(evidence.id); node.updatedAt = now();
+				const covered = new Set(state.evidence.flatMap((item) => item.criterionIds));
+				const uncovered = node.criterionIds.filter((id) => !covered.has(id));
+				if (!uncovered.length) {
+					node.status = "done";
+					const next = state.plan.find((item) => item.status === "pending" && pendingDependencies(state, item).length === 0); if (next) next.status = "in_progress";
+					state.currentAction = next?.title ?? "Verify completion"; state.nextAction = state.plan.find((item) => item.status === "pending")?.title ?? "Submit completion candidate";
+				} else {
+					node.status = "in_progress";
+					state.currentAction = node.title;
+					state.nextAction = `Collect criterion-specific evidence for ${uncovered.join(", ")}`;
+				}
 			}
 			persist(ctx, "evidence_recorded", cleaned.text); return toolResult("Evidence recorded for current goal step.");
 		}),
@@ -928,7 +946,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				if (state.continuationSequence !== sequence) throw new Error("Goal changed while completion checks were running");
 				recordVerificationResults(state, checks);
 				if (!checks.length || checks.some((result) => !result.passed)) {
-					transitionVerificationFailure(ctx, state, checks, false);
+					transitionVerificationFailure(ctx, state, checks, "preflight");
 					return toolResult(`Completion candidate rejected by approved checks. ${checks.find((result) => !result.passed)?.summary ?? "No verification result was produced."}`, { checks });
 				}
 				clearVerificationFailure(state);
@@ -942,10 +960,25 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "pi_goal_status",
 		label: "Goal Status",
-		description: "Return current goal ID, generation, phase, current action, and next action.",
+		description: "Return sanitized goal outcome, criteria, plan, approved check targets, phase, and current/next action.",
 		parameters: Type.Object({}),
 		execute: async (_id, _params, _signal, _update, ctx) => {
-			const state = load(ctx); return toolResult(state ? JSON.stringify({ goalId: state.goalId, generation: state.generation, status: state.status, phase: state.phase, currentAction: state.currentAction, nextAction: state.nextAction, interrupt: state.interrupt?.class }) : "No goal");
+			const state = load(ctx);
+			return toolResult(state ? JSON.stringify({
+				goalId: state.goalId,
+				generation: state.generation,
+				status: state.status,
+				phase: state.phase,
+				outcome: state.outcome.current,
+				criteria: state.criteria.map(({ id, text, status, evidenceIds }) => ({ id, text, status, evidenceCount: evidenceIds.length })),
+				plan: state.plan.map(({ id, title, description, status, dependsOn, criterionIds }) => ({ id, title, description, status, dependsOn, criterionIds })),
+				verificationChecks: state.verificationChecks.map((check) => approvedCheckContextLine(state, check)),
+				currentAction: state.currentAction,
+				nextAction: state.nextAction,
+				interrupt: state.interrupt?.class,
+				verificationFailureCount: state.verificationFailureCount,
+				verificationRecoveryStartedAt: state.verificationRecoveryStartedAt,
+			}) : "No goal");
 		},
 	});
 
@@ -1009,6 +1042,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify('Exact approval required: type "approve exact pending risk once" or use bare /goal.', "warning");
 				return { action: "handled" as const };
 			}
+			if (isInformationalGoalInput(text)) return;
 			const cleaned = redactText(text, 2_000);
 			clearVerificationFailure(state);
 			state.outcome.amendments.push({ id: makeId("steering"), text: cleaned.text, createdAt: now() }); state.generation += 1; state.continuationSequence += 1; state.lastContinuationKey = undefined; state.completionCandidate = false; state.currentAction = "Applying user steering"; state.nextAction = cleaned.text;
