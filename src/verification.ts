@@ -1,0 +1,170 @@
+import { existsSync, readFileSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
+import { spawn } from "node:child_process";
+import { Type } from "typebox";
+import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { isSensitivePath, isWithinWorkspace, redactText } from "./state.ts";
+import type { GoalState, VerificationCheck, VerificationResult } from "./types.ts";
+
+const DENIED_EXECUTABLES = new Set([
+	"bash", "sh", "zsh", "fish", "sudo", "su", "doas", "ssh", "scp", "rsync",
+	"curl", "wget", "systemctl", "service", "docker", "podman", "kubectl", "helm",
+]);
+
+function safeEnvironment(): NodeJS.ProcessEnv {
+	const allowed = /^(?:PATH|HOME|USER|LOGNAME|SHELL|TMPDIR|TMP|TEMP|LANG|LC_[A-Z_]+|TERM|COLORTERM|CI|NO_COLOR|FORCE_COLOR|NODE_[A-Z_]+|npm_config_[A-Za-z_]+)$/;
+	return Object.fromEntries(
+		Object.entries(process.env).filter(([key, value]) => value !== undefined && allowed.test(key) && !/(?:token|secret|password|credential|auth|cookie|key)/i.test(key)),
+	);
+}
+
+function runProcess(
+	executable: string,
+	args: string[],
+	cwd: string,
+	timeoutMs: number,
+	signal?: AbortSignal,
+): Promise<{ exitCode: number; durationMs: number; stdout: string }> {
+	return new Promise((resolvePromise, reject) => {
+		const started = Date.now();
+		let settled = false;
+		const child = spawn(executable, args, {
+			cwd,
+			shell: false,
+			stdio: ["ignore", "pipe", "pipe"],
+			env: safeEnvironment(),
+		});
+		let bytes = 0;
+		let stdout = "";
+		const consume = (chunk: Buffer, capture: boolean) => {
+			bytes += chunk.length;
+			if (capture && stdout.length < 1_000_000) stdout += chunk.toString("utf8").slice(0, 1_000_000 - stdout.length);
+			if (bytes > 2_000_000) child.kill("SIGTERM");
+		};
+		child.stdout?.on("data", (chunk: Buffer) => consume(chunk, true));
+		child.stderr?.on("data", (chunk: Buffer) => consume(chunk, false));
+		const timer = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
+		const abort = () => child.kill("SIGTERM");
+		signal?.addEventListener("abort", abort, { once: true });
+		child.on("error", (error) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", abort);
+			reject(error);
+		});
+		child.on("close", (code) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", abort);
+			resolvePromise({ exitCode: typeof code === "number" ? code : 128, durationMs: Date.now() - started, stdout });
+		});
+	});
+}
+
+function jsonPointer(value: unknown, pointer: string): unknown {
+	if (pointer === "") return value;
+	if (!pointer.startsWith("/")) return undefined;
+	let current = value;
+	for (const raw of pointer.slice(1).split("/")) {
+		const key = raw.replace(/~1/g, "/").replace(/~0/g, "~");
+		if (!current || typeof current !== "object" || !(key in current)) return undefined;
+		current = (current as Record<string, unknown>)[key];
+	}
+	return current;
+}
+
+function checkedPath(cwd: string, path: string): string {
+	if (isSensitivePath(path)) throw new Error("verification path is secret-like and cannot be inspected");
+	if (!isWithinWorkspace(cwd, path)) throw new Error("verification path leaves the approved workspace");
+	return resolve(cwd, path);
+}
+
+function validateExecutable(check: Extract<VerificationCheck, { kind: "command_exit" }>, workspace: string): { executable: string; cwd: string } {
+	if (!check.executable || /[\s;&|<>`$\n\r]/.test(check.executable)) throw new Error("verification executable is invalid");
+	const basename = check.executable.split(/[\\/]/).at(-1) ?? check.executable;
+	if (DENIED_EXECUTABLES.has(basename)) throw new Error(`verification executable is denied: ${basename}`);
+	if (check.args.some((arg) => typeof arg !== "string" || /[\u0000\n\r]/.test(arg))) throw new Error("verification argv contains an invalid value");
+	if (["npm", "pnpm", "yarn"].includes(basename)) {
+		const operation = check.args[0] ?? "";
+		if (/^(?:install|i|add|publish|unpublish|deprecate|login|logout|pack|exec|explore|x|init)$/.test(operation)) throw new Error(`verification package operation is denied: ${operation}`);
+		if (operation === "run" && !/^(?:test|check|lint|build|typecheck|verify)(?::[A-Za-z0-9._-]+)?$/.test(check.args[1] ?? "")) throw new Error("verification npm script is outside the test/check/lint/build allowlist");
+	}
+	if (basename === "git" && !["status", "diff", "show", "log", "rev-parse", "ls-files", "grep"].includes(check.args[0] ?? "")) throw new Error("verification git operation is not read-only");
+	const cwd = check.cwd ? checkedPath(workspace, check.cwd) : workspace;
+	const executable = isAbsolute(check.executable) ? checkedPath(workspace, check.executable) : check.executable;
+	return { executable, cwd };
+}
+
+export async function runVerificationCheck(check: VerificationCheck, workspace: string, signal?: AbortSignal): Promise<VerificationResult> {
+	const started = Date.now();
+	try {
+		switch (check.kind) {
+			case "file_exists": {
+				const passed = existsSync(checkedPath(workspace, check.path));
+				return { checkId: check.id, passed, summary: passed ? "required file exists" : "required file is missing", durationMs: Date.now() - started };
+			}
+			case "file_contains": {
+				const text = readFileSync(checkedPath(workspace, check.path), "utf8");
+				const passed = check.regex ? new RegExp(check.pattern, "m").test(text) : text.includes(check.pattern);
+				return { checkId: check.id, passed, summary: passed ? "required content found" : "required content not found", durationMs: Date.now() - started };
+			}
+			case "json_equals": {
+				const document = JSON.parse(readFileSync(checkedPath(workspace, check.path), "utf8"));
+				const passed = JSON.stringify(jsonPointer(document, check.pointer)) === JSON.stringify(check.value);
+				return { checkId: check.id, passed, summary: passed ? "JSON value matches" : "JSON value differs", durationMs: Date.now() - started };
+			}
+			case "command_exit": {
+				const { executable, cwd } = validateExecutable(check, workspace);
+				const result = await runProcess(executable, check.args, cwd, Math.max(1_000, Math.min(check.timeoutMs ?? 120_000, 900_000)), signal);
+				const expected = check.expectedExitCode ?? 0;
+				return { checkId: check.id, passed: result.exitCode === expected, summary: result.exitCode === expected ? `command exited ${expected}` : `command exited ${result.exitCode}; expected ${expected}`, exitCode: result.exitCode, durationMs: result.durationMs };
+			}
+			case "git_status": {
+				const result = await runProcess("git", ["status", "--porcelain"], workspace, 30_000, signal);
+				if (result.exitCode !== 0) return { checkId: check.id, passed: false, summary: `git status exited ${result.exitCode}`, exitCode: result.exitCode, durationMs: result.durationMs };
+				const isClean = result.stdout.trim().length === 0;
+				const expectedClean = check.clean !== false;
+				const passed = expectedClean ? isClean : !isClean;
+				return { checkId: check.id, passed, summary: passed ? (expectedClean ? "git worktree is clean" : "git worktree contains changes") : (expectedClean ? "git worktree contains changes" : "git worktree is clean"), exitCode: passed ? 0 : 1, durationMs: result.durationMs };
+			}
+			case "git_diff": {
+				const args = ["diff", "--quiet", ...(check.paths?.length ? ["--", ...check.paths.map((path) => checkedPath(workspace, path))] : [])];
+				const result = await runProcess("git", args, workspace, 30_000, signal);
+				const expectedEmpty = check.empty !== false;
+				const passed = expectedEmpty ? result.exitCode === 0 : result.exitCode === 1;
+				return { checkId: check.id, passed, summary: passed ? (expectedEmpty ? "git diff is empty" : "git diff contains changes") : (expectedEmpty ? "git diff contains changes" : "git diff is empty"), exitCode: result.exitCode, durationMs: result.durationMs };
+			}
+		}
+	} catch (error) {
+		return { checkId: check.id, passed: false, summary: error instanceof Error ? error.message : String(error), durationMs: Date.now() - started };
+	}
+}
+
+function labelApprovedCheckResult(check: VerificationCheck, result: VerificationResult): VerificationResult {
+	const label = JSON.stringify(redactText(check.label, 120).text);
+	return { ...result, summary: `setup-approved check ${check.id} ${label}: ${result.summary}` };
+}
+
+export async function runAllChecks(state: GoalState, signal?: AbortSignal): Promise<VerificationResult[]> {
+	const results: VerificationResult[] = [];
+	for (const check of state.verificationChecks) results.push(labelApprovedCheckResult(check, await runVerificationCheck(check, state.cwd, signal)));
+	return results;
+}
+
+export function createAuditorCheckTool(getState: () => GoalState): ToolDefinition {
+	return defineTool({
+		name: "pi_goal_run_check",
+		label: "Run Approved Goal Check",
+		description: "Run one setup-approved verification check by ID. The auditor cannot alter the check definition.",
+		parameters: Type.Object({ checkId: Type.String() }),
+		execute: async (_toolCallId, params, signal) => {
+			const state = getState();
+			const check = state.verificationChecks.find((item) => item.id === params.checkId);
+			if (!check) throw new Error(`Unknown approved verification check: ${params.checkId}`);
+			const result = await runVerificationCheck(check, state.cwd, signal);
+			return { content: [{ type: "text" as const, text: JSON.stringify(result) }], details: result };
+		},
+	});
+}

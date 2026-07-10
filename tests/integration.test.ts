@@ -1,0 +1,506 @@
+import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import { IsolatedModelRunner, SETUP_PLANNER_SYSTEM_PROMPT, normalizeAuditDecision, normalizeDraft } from "../src/evaluator.ts";
+import piGoalExtension, { validateAuditCompletion } from "../src/index.ts";
+import { STATE_CUSTOM_TYPE, createGoalState, sha256 } from "../src/state.ts";
+import type { GoalDraft } from "../src/types.ts";
+
+const draft: GoalDraft = {
+	outcome: "Complete integration",
+	criteria: ["State is durable"],
+	phases: [{ id: "P1", title: "Implement", criterionIds: ["AC1"] }],
+	verificationChecks: [{ id: "V1", kind: "file_exists", label: "manifest", path: "package.json" }],
+	authorities: [], constraints: [], nonGoals: [],
+};
+
+function makeHarness(root: string, mode = "tui") {
+	process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+	const handlers = new Map<string, Function[]>();
+	const commands = new Map<string, any>();
+	const tools = new Map<string, any>();
+	const messages: any[] = [];
+	const notifications: any[] = [];
+	const branch: any[] = [];
+	let aborts = 0;
+	const bus = new Map<string, Set<(data: unknown) => void>>();
+	const pi: any = {
+		on(name: string, handler: Function) { const list = handlers.get(name) ?? []; list.push(handler); handlers.set(name, list); },
+		registerCommand(name: string, spec: any) { commands.set(name, spec); },
+		registerTool(spec: any) { tools.set(spec.name, spec); },
+		getAllTools() { return [
+			{ name: "read", description: "Read file", parameters: {} },
+			{ name: "write", description: "Write file", parameters: {} },
+			{ name: "bash", description: "Run command", parameters: {} },
+			{ name: "records_create", description: "Create external record", parameters: {} },
+			{ name: "job_start", description: "Start one read-only job in the background and return a job ID", parameters: {} },
+		]; },
+		appendEntry(customType: string, data: unknown) { branch.push({ type: "custom", customType, data: structuredClone(data) }); },
+		sendMessage(message: unknown, options: unknown) { messages.push({ message, options }); },
+		events: {
+			on(channel: string, fn: (data: unknown) => void) { const set = bus.get(channel) ?? new Set(); set.add(fn); bus.set(channel, set); return () => set.delete(fn); },
+			emit(channel: string, data: unknown) { for (const fn of bus.get(channel) ?? []) fn(data); },
+		},
+	};
+	piGoalExtension(pi);
+	const ctx: any = {
+		cwd: join(root, "workspace"), mode, hasUI: mode === "tui", model: undefined, modelRegistry: {},
+		isIdle: () => true, hasPendingMessages: () => false, abort: () => { aborts += 1; },
+		sessionManager: { getSessionId: () => "session-integration", getBranch: () => branch },
+		ui: {
+			notify(message: string, type?: string) { notifications.push({ message, type }); },
+			setStatus() {}, setWidget() {}, setWorkingMessage() {},
+			theme: { fg: (_color: string, text: string) => text },
+			custom: async () => "close", confirm: async () => true, editor: async () => undefined,
+		},
+	};
+	return {
+		pi, ctx, branch, commands, tools, messages, notifications, get aborts() { return aborts; },
+		async emit(name: string, event: any) { const results = []; for (const handler of handlers.get(name) ?? []) results.push(await handler(event, ctx)); return results; },
+		async command(name: string, args: string) { return commands.get(name).handler(args, ctx); },
+		async tool(name: string, params: any) { return tools.get(name).execute(`${name}-call`, params, undefined, undefined, ctx); },
+	};
+}
+
+function injectRunning(harness: ReturnType<typeof makeHarness>) {
+	const state = createGoalState(draft, harness.ctx);
+	state.status = "running"; state.phase = "executing"; state.approvedAt = new Date().toISOString();
+	harness.branch.push({ type: "custom", customType: STATE_CUSTOM_TYPE, data: state });
+	return state;
+}
+
+function latestState(harness: ReturnType<typeof makeHarness>) {
+	return harness.branch.filter((entry) => entry.customType === STATE_CUSTOM_TYPE).at(-1).data;
+}
+
+function goalArtifact(root: string, name: "state.json" | "events.jsonl" | "evidence.json"): string {
+	const sessionKey = sha256("session-integration").slice(0, 24);
+	return join(root, "agent", "pi-goal", "sessions", sessionKey, name);
+}
+
+test("registers only canonical /goal and rejects noninteractive starts", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root, "print");
+		assert.equal(harness.commands.has("goal"), true);
+		assert.equal(harness.commands.has("plan"), false);
+		await harness.command("goal", "Do work");
+		assert.match(harness.notifications.at(-1).message, /requires interactive Pi TUI/);
+		assert.equal(harness.branch.length, 0);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("restores running state, injects it every turn, and blocks out-of-workspace mutation", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root);
+		const initial = injectRunning(harness);
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		const context = (await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "x" })).find(Boolean);
+		assert.match(JSON.stringify(context), /GOAL MODE ACTIVE/);
+		assert.match(JSON.stringify(context), new RegExp(initial.goalId));
+		const allowed = (await harness.emit("tool_call", { type: "tool_call", toolName: "write", toolCallId: "w1", input: { path: "src/a.ts", content: "x" } })).find(Boolean);
+		assert.equal(allowed, undefined);
+		const blocked = (await harness.emit("tool_call", { type: "tool_call", toolName: "write", toolCallId: "w2", input: { path: "../outside", content: "x" } })).find(Boolean);
+		assert.equal(blocked.block, true);
+		assert.match(blocked.reason, /Goal RISK/);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("complex verification shell soft-denies without user interruption", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root);
+		injectRunning(harness);
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		const messagesBefore = harness.messages.length;
+		const command = "test -f READY.md && printf 'exists '; wc -c < READY.md && grep -qx 'READY' READY.md";
+		const blocked = (await harness.emit("tool_call", { type: "tool_call", toolName: "bash", toolCallId: "b1", input: { command } })).find(Boolean);
+		assert.equal(blocked.block, true);
+		assert.match(blocked.reason, /Goal recoverable denial/);
+		const persisted = latestState(harness);
+		assert.equal(persisted.status, "running");
+		assert.equal(persisted.phase, "recovering");
+		assert.equal(persisted.interrupt, undefined);
+		assert.match(persisted.nextAction, /read, grep, ls|approved verification/);
+		assert.equal(harness.messages.length, messagesBefore);
+		const events = readFileSync(goalArtifact(root, "events.jsonl"), "utf8");
+		assert.match(events, /tool_soft_denied/);
+		assert.doesNotMatch(events, /printf 'exists '/);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("private and secret reads soft-deny without persisting sensitive input", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root);
+		injectRunning(harness);
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		const privateFile = join(root, "agent", "pi-goal", "sessions", "any", "state.json");
+		const privateBlocked = (await harness.emit("tool_call", { type: "tool_call", toolName: "read", toolCallId: "private", input: { path: privateFile } })).find(Boolean);
+		assert.match(privateBlocked.reason, /recoverable denial/);
+		assert.equal(latestState(harness).interrupt, undefined);
+		const secret = "not-a-real-secret-DO-NOT-PERSIST";
+		const secretBlocked = (await harness.emit("tool_call", { type: "tool_call", toolName: "records_create", toolCallId: "secret", input: { api_token: secret } })).find(Boolean);
+		assert.match(secretBlocked.reason, /recoverable denial/);
+		const persisted = latestState(harness);
+		assert.equal(persisted.status, "running");
+		assert.equal(persisted.interrupt, undefined);
+		for (const name of ["state.json", "events.jsonl", "evidence.json"] as const) assert.doesNotMatch(readFileSync(goalArtifact(root, name), "utf8"), new RegExp(secret));
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("destructive and external mutations still open RISK", async () => {
+	const cases: Array<[string, string, Record<string, unknown>]> = [
+		["complex deletion", "bash", { command: "echo ok; rm -rf dist" }],
+		["remote git", "bash", { command: "git push origin main" }],
+		["package install", "bash", { command: "npm install" }],
+		["outside write", "write", { path: "../outside", content: "x" }],
+		["unknown mutation", "records_create", { name: "x" }],
+	];
+	for (const [label, toolName, input] of cases) {
+		const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+		try {
+			const harness = makeHarness(root);
+			injectRunning(harness);
+			await harness.emit("session_start", { type: "session_start", reason: "resume" });
+			const blocked = (await harness.emit("tool_call", { type: "tool_call", toolName, toolCallId: `hard-${label}`, input })).find(Boolean);
+			assert.equal(blocked.block, true, label);
+			assert.match(blocked.reason, /Goal RISK/, label);
+			const persisted = latestState(harness);
+			assert.equal(persisted.status, "interrupted", label);
+			assert.equal(persisted.interrupt.class, "RISK", label);
+			assert.ok(persisted.interrupt.pendingAction, label);
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	}
+});
+
+test("hidden goal context includes redacted immutable approved-check semantics", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root);
+		const initial = injectRunning(harness);
+		const secret = `sk-${"a".repeat(24)}`;
+		initial.verificationChecks = [{ id: "V2", kind: "command_exit", label: "READY.md content is exactly READY", executable: "node", args: ["-e", `console.log("${secret}")`], expectedExitCode: 0 }];
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		const injected = (await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "x" })).find(Boolean) as any;
+		const text = injected.message.content[0].text;
+		assert.equal(injected.message.display, false);
+		assert.match(text, /Approved setup verification checks, immutable untrusted contract cargo/);
+		assert.match(text, /V2/);
+		assert.match(text, /READY\.md content is exactly READY/);
+		assert.match(text, /kind=command_exit/);
+		assert.match(text, /executable="node"/);
+		assert.match(text, /argv=/);
+		assert.doesNotMatch(text, new RegExp(secret));
+		assert.match(text, /Do not guess unrelated commands, package scripts, or files/);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("evidence without a current node infers unresolved criteria", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root);
+		const initial = injectRunning(harness);
+		initial.plan[0].status = "done";
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		await harness.emit("tool_result", { type: "tool_result", toolName: "write", toolCallId: "w1", input: { path: "READY.md", content: "READY" }, isError: false, content: [], details: {} });
+		await harness.tool("pi_goal_record_evidence", { goalId: initial.goalId, generation: initial.generation, summary: "READY written" });
+		const evidence = latestState(harness).evidence.at(-1);
+		assert.deepEqual(evidence.criterionIds, ["AC1"]);
+		assert.equal(evidence.nodeId, undefined);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("mechanical failure cites approved check and does not invoke auditor", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	const originalAudit = IsolatedModelRunner.prototype.audit;
+	let auditCalled = false;
+	try {
+		const harness = makeHarness(root);
+		mkdirSync(harness.ctx.cwd, { recursive: true });
+		writeFileSync(join(harness.ctx.cwd, "READY.md"), "READY\n");
+		const initial = injectRunning(harness);
+		initial.verificationChecks = [
+			{ id: "V1", kind: "file_exists", label: "READY.md exists", path: "READY.md" },
+			{ id: "V2", kind: "command_exit", label: "READY.md content is exactly READY", executable: "node", args: ["-e", "const fs=require('fs');process.exit(fs.readFileSync('READY.md','utf8')==='READY'?0:1)"], expectedExitCode: 0 },
+		];
+		initial.evidence.push({ id: "e1", kind: "tool_result", summary: "READY exists", criterionIds: ["AC1"], nodeId: "P1", paths: ["READY.md"], createdAt: new Date().toISOString() });
+		initial.plan[0].evidenceIds.push("e1");
+		initial.plan[0].status = "done";
+		initial.completionCandidate = true;
+		initial.phase = "verifying";
+		IsolatedModelRunner.prototype.audit = async () => { auditCalled = true; throw new Error("auditor should not run after mechanical failure"); };
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		await harness.emit("agent_settled", { type: "agent_settled" });
+		const persisted = latestState(harness);
+		assert.equal(auditCalled, false);
+		assert.equal(persisted.status, "running");
+		assert.equal(persisted.phase, "recovering");
+		assert.equal(persisted.currentAction, "Repairing failed verification");
+		assert.match(persisted.nextAction, /setup-approved check V2 "READY\.md content is exactly READY"/);
+		assert.equal(persisted.auditReports.length, 0);
+		const events = readFileSync(goalArtifact(root, "events.jsonl"), "utf8");
+		assert.match(events, /verification_failed/);
+		assert.doesNotMatch(events, /audit_rejected/);
+	} finally {
+		IsolatedModelRunner.prototype.audit = originalAudit;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("stale internal tool generations fail and user steering increments generation", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root);
+		const initial = injectRunning(harness);
+		const initialGeneration = initial.generation;
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		await assert.rejects(() => harness.tool("pi_goal_update_plan", { goalId: initial.goalId, generation: initialGeneration + 1, reason: "stale", nodes: [{ id: "P1", title: "x", status: "in_progress" }] }), /Stale goal ID or generation/);
+		await harness.emit("input", { type: "input", source: "interactive", text: "Also verify documentation" });
+		const result = await harness.tool("pi_goal_status", {});
+		const payload = JSON.parse(result.content[0].text);
+		assert.equal(payload.generation, initialGeneration + 1);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("evidence links recent successful observations without exposing tool-call IDs", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root);
+		const initial = injectRunning(harness);
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		await harness.emit("tool_result", { type: "tool_result", toolName: "write", toolCallId: "write-hidden-id", input: { path: "README.md", content: "x" }, isError: false, content: [], details: {} });
+		const result = await harness.tool("pi_goal_record_evidence", { goalId: initial.goalId, generation: initial.generation, summary: "README created" });
+		assert.match(result.content[0].text, /Evidence recorded/);
+		const persisted = harness.branch.filter((entry) => entry.customType === STATE_CUSTOM_TYPE).at(-1).data;
+		assert.equal(persisted.evidence.length, 1);
+		assert.deepEqual(persisted.evidence[0].criterionIds, ["AC1"]);
+		assert.equal(persisted.evidence[0].nodeId, "P1");
+		assert.equal(persisted.plan[0].status, "done");
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("explicit unknown evidence IDs fail before state mutation", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root);
+		const initial = injectRunning(harness);
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		await harness.emit("tool_result", { type: "tool_result", toolName: "write", toolCallId: "write-hidden-id", input: { path: "README.md", content: "x" }, isError: false, content: [], details: {} });
+		await assert.rejects(() => harness.tool("pi_goal_record_evidence", { goalId: initial.goalId, generation: initial.generation, summary: "bad", criterionIds: ["BAD"] }), /Valid criteria: AC1/);
+		await assert.rejects(() => harness.tool("pi_goal_record_evidence", { goalId: initial.goalId, generation: initial.generation, summary: "bad", criterionIds: ["AC1"], nodeId: "BAD" }), /Valid nodes: P1/);
+		await harness.emit("tool_result", { type: "tool_result", toolName: "read", toolCallId: "persist-after-rejection", input: { path: "package.json" }, isError: false, content: [], details: {} });
+		const persisted = harness.branch.filter((entry) => entry.customType === STATE_CUSTOM_TYPE).at(-1).data;
+		assert.equal(persisted.evidence.length, 0);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("planner rejects circular audit-process criteria before approval", () => {
+	assert.match(SETUP_PLANNER_SYSTEM_PROMPT, /Never add criteria about submitting completion/);
+	assert.throws(() => normalizeDraft({
+		outcome: "Create READY.md",
+		criteria: ["READY.md exists", "Completion is submitted to the independent verifier/auditor and accepted before finishing."],
+		phases: [{ id: "P1", title: "Create", criterionIds: ["AC1", "AC2"] }],
+		verificationChecks: [{ id: "V1", kind: "file_exists", label: "READY exists", path: "READY.md" }],
+		authorities: [], constraints: [], nonGoals: [],
+	}, "Create READY.md"), /process-only audit criteria.*Completion is submitted/);
+	const substantive = normalizeDraft({
+		outcome: "Create READY.md",
+		criteria: ["READY.md exists"],
+		phases: [{ id: "P1", title: "Create", criterionIds: ["AC1"] }],
+		verificationChecks: [{ id: "V1", kind: "file_exists", label: "READY exists", path: "READY.md" }],
+		authorities: [], constraints: [], nonGoals: [],
+	}, "Create READY.md");
+	assert.deepEqual(substantive.criteria, ["READY.md exists"]);
+});
+
+test("audit normalization accepts explicit pass aliases and rejects ambiguous status", () => {
+	const normalized = normalizeAuditDecision({ verdict: "pass", reason: "ok", criterionResults: [{ criterionId: "AC1", status: "pass", evidenceIds: ["e1"], note: "ok" }], missingCriteria: [] });
+	assert.equal(normalized.criterionResults[0].status, "met");
+	assert.throws(() => normalizeAuditDecision({ verdict: "pass", reason: "ok", criterionResults: [{ criterionId: "AC1", status: "approved", evidenceIds: ["e1"], note: "ok" }], missingCriteria: [] }), /unsupported criterion status/);
+});
+
+test("audit completion requires exact criterion coverage and never partially mutates", () => {
+	const completeDraft: GoalDraft = {
+		outcome: "Complete audit",
+		criteria: ["One", "Two"],
+		phases: [{ id: "P1", title: "Work", criterionIds: ["AC1", "AC2"] }],
+		verificationChecks: [{ id: "V1", kind: "file_exists", label: "manifest", path: "package.json" }],
+		authorities: [], constraints: [], nonGoals: [],
+	};
+	const value = createGoalState(completeDraft, { cwd: "/tmp/work", sessionManager: { getSessionId: () => "audit" } } as any);
+	value.status = "running";
+	value.evidence.push({ id: "e1", kind: "tool_result", summary: "one", criterionIds: ["AC1"], paths: [], createdAt: new Date().toISOString() });
+	value.evidence.push({ id: "e2", kind: "tool_result", summary: "two", criterionIds: ["AC2"], paths: [], createdAt: new Date().toISOString() });
+	const before = structuredClone(value.criteria);
+	const duplicate = validateAuditCompletion(value, { verdict: "pass", reason: "bad coverage", criterionResults: [
+		{ criterionId: "AC1", status: "met", evidenceIds: ["e1"], note: "one" },
+		{ criterionId: "AC1", status: "met", evidenceIds: ["e1"], note: "duplicate" },
+	], missingCriteria: [] });
+	assert.equal(duplicate.valid, false);
+	assert.deepEqual(value.criteria, before);
+	const missing = validateAuditCompletion(value, { verdict: "pass", reason: "missing", criterionResults: [{ criterionId: "AC1", status: "met", evidenceIds: ["e1"], note: "one" }], missingCriteria: [] });
+	assert.equal(missing.valid, false);
+	const unknown = validateAuditCompletion(value, { verdict: "pass", reason: "unknown", criterionResults: [
+		{ criterionId: "AC1", status: "met", evidenceIds: ["e1"], note: "one" },
+		{ criterionId: "BAD", status: "met", evidenceIds: ["e2"], note: "bad" },
+	], missingCriteria: [] });
+	assert.equal(unknown.valid, false);
+});
+
+test("full candidate audit normalizes pass to met and completes", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	const originalAudit = IsolatedModelRunner.prototype.audit;
+	try {
+		const harness = makeHarness(root);
+		mkdirSync(harness.ctx.cwd, { recursive: true });
+		writeFileSync(join(harness.ctx.cwd, "package.json"), "{}\n");
+		const initial = injectRunning(harness);
+		initial.evidence.push({ id: "e1", kind: "tool_result", summary: "manifest exists", criterionIds: ["AC1"], nodeId: "P1", paths: ["package.json"], createdAt: new Date().toISOString() });
+		initial.plan[0].evidenceIds.push("e1");
+		initial.plan[0].status = "done";
+		initial.completionCandidate = true;
+		initial.phase = "verifying";
+		IsolatedModelRunner.prototype.audit = async () => normalizeAuditDecision({ verdict: "pass", reason: "All evidence and checks passed", criterionResults: [{ criterionId: "AC1", status: "pass", evidenceIds: ["e1", "V1"], note: "verified" }], missingCriteria: [] });
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		await harness.emit("agent_settled", { type: "agent_settled" });
+		const persisted = harness.branch.filter((entry) => entry.customType === STATE_CUSTOM_TYPE).at(-1).data;
+		assert.equal(persisted.status, "completed");
+		assert.equal(persisted.criteria[0].status, "met");
+		assert.equal(persisted.auditReports.at(-1).verdict, "pass");
+		assert.match(JSON.stringify(harness.messages), /Goal complete and independently verified/);
+	} finally {
+		IsolatedModelRunner.prototype.audit = originalAudit;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("replanning cannot self-certify a node done without evidence", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root);
+		const initial = injectRunning(harness);
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		await assert.rejects(() => harness.tool("pi_goal_update_plan", { goalId: initial.goalId, generation: initial.generation, reason: "claim done", nodes: [{ id: "P1", title: "Implement", status: "done", criterionIds: ["AC1"] }] }), /without linked evidence/);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("declared background work blocks continuation until a correlated terminal message", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root);
+		injectRunning(harness);
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		const allowed = (await harness.emit("tool_call", { type: "tool_call", toolName: "job_start", toolCallId: "j1", input: { task: "inspect" } })).find(Boolean);
+		assert.equal(allowed, undefined);
+		await harness.emit("tool_result", { type: "tool_result", toolName: "job_start", toolCallId: "j1", input: { task: "inspect" }, isError: false, content: [], details: { job_id: "job-1", state: "running" } });
+		let persisted = harness.branch.filter((entry) => entry.customType === STATE_CUSTOM_TYPE).at(-1).data;
+		assert.ok(persisted.backgroundWork["job-1"]);
+		await harness.emit("message_end", { type: "message_end", message: { role: "custom", customType: "job-completion", content: "done", details: { job_id: "job-1", state: "completed" } } });
+		persisted = harness.branch.filter((entry) => entry.customType === STATE_CUSTOM_TYPE).at(-1).data;
+		assert.equal(persisted.backgroundWork["job-1"], undefined);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("declared background tool without a job identity fails closed", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root);
+		injectRunning(harness);
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		await harness.emit("tool_result", { type: "tool_result", toolName: "job_start", toolCallId: "j1", input: { task: "inspect" }, isError: false, content: [], details: { state: "running" } });
+		const persisted = harness.branch.filter((entry) => entry.customType === STATE_CUSTOM_TYPE).at(-1).data;
+		assert.equal(persisted.interrupt.class, "BLOCKER");
+		assert.match(persisted.interrupt.message, /no trackable job identity/);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("third identical call triggers autonomous recovery guard", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root);
+		injectRunning(harness);
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		const event = { type: "tool_call", toolName: "read", toolCallId: "r", input: { path: "README.md" } };
+		assert.equal((await harness.emit("tool_call", event)).find(Boolean), undefined);
+		assert.equal((await harness.emit("tool_call", { ...event, toolCallId: "r2" })).find(Boolean), undefined);
+		for (let attempt = 3; attempt <= 5; attempt += 1) {
+			const blocked = (await harness.emit("tool_call", { ...event, toolCallId: `r${attempt}` })).find(Boolean);
+			assert.equal(blocked.block, true);
+			assert.match(blocked.reason, /Repeated identical call/);
+		}
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("pause, steering, resume, and cancellation invalidate queued work", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-controls-"));
+	try {
+		const harness = makeHarness(root);
+		injectRunning(harness);
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		const stale = { role: "custom", ...harness.messages.at(-1).message };
+		await harness.emit("input", { type: "input", source: "interactive", text: "pause goal" });
+		assert.equal(latestState(harness).status, "paused");
+		assert.equal(harness.aborts, 1);
+		assert.equal((await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "x" })).find(Boolean), undefined);
+		const filtered = (await harness.emit("context", { type: "context", messages: [stale] })).find(Boolean);
+		assert.equal(filtered.messages.length, 0);
+		await harness.emit("input", { type: "input", source: "interactive", text: "Also verify documentation" });
+		assert.equal(latestState(harness).status, "paused");
+		assert.match(latestState(harness).outcome.amendments.at(-1).text, /verify documentation/);
+		await harness.emit("input", { type: "input", source: "interactive", text: "resume goal" });
+		assert.equal(latestState(harness).status, "running");
+		assert.match(JSON.stringify(harness.messages.at(-1)), /Resume from durable state/);
+		await harness.emit("input", { type: "input", source: "interactive", text: "cancel goal" });
+		assert.equal(latestState(harness).status, "cancelled");
+		assert.equal(harness.aborts, 2);
+		assert.equal((await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "x" })).find(Boolean), undefined);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("pending RISK requires exact phrase and consumes matching authority before execution", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-risk-"));
+	try {
+		const harness = makeHarness(root);
+		injectRunning(harness);
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		const input = { name: "external" };
+		assert.equal((await harness.emit("tool_call", { type: "tool_call", toolName: "records_create", toolCallId: "risk-1", input })).find(Boolean).block, true);
+		await harness.emit("input", { type: "input", source: "interactive", text: "approve it" });
+		assert.equal(latestState(harness).authorities.length, 0);
+		assert.match(harness.notifications.at(-1).message, /Exact approval required/);
+		await harness.emit("input", { type: "input", source: "interactive", text: "approve exact pending risk once" });
+		assert.equal(latestState(harness).authorities.length, 1);
+		assert.equal((await harness.emit("tool_call", { type: "tool_call", toolName: "records_create", toolCallId: "risk-2", input })).find(Boolean), undefined);
+		assert.equal(latestState(harness).authorities[0].uses, 1);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("background event completion, reload, and manual compaction queue fresh continuation", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-recovery-"));
+	try {
+		const harness = makeHarness(root);
+		injectRunning(harness);
+		await harness.emit("session_start", { type: "session_start", reason: "reload" });
+		assert.match(JSON.stringify(harness.messages.at(-1)), /Resume active goal after reload/);
+		harness.messages.length = 0;
+		harness.pi.events.emit("pi-goal:background-start", { id: "job-bus", label: "watch" });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.ok(latestState(harness).backgroundWork["job-bus"]);
+		harness.pi.events.emit("pi-goal:background-end", { id: "job-bus" });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(latestState(harness).backgroundWork["job-bus"], undefined);
+		assert.match(JSON.stringify(harness.messages.at(-1)), /background work completed/);
+		harness.messages.length = 0;
+		const before = latestState(harness).continuationSequence;
+		await harness.emit("session_compact", { type: "session_compact", willRetry: false });
+		assert.ok(latestState(harness).continuationSequence > before);
+		assert.match(JSON.stringify(harness.messages.at(-1)), /Continue after compaction/);
+		harness.messages.length = 0;
+		await harness.emit("session_compact", { type: "session_compact", willRetry: true });
+		assert.equal(harness.messages.length, 0);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
