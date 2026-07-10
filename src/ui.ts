@@ -191,6 +191,16 @@ export function widgetLines(ctx: ExtensionContext, state: GoalState): string[] {
 	];
 }
 
+export function showPlanningUi(ctx: ExtensionContext, stage: "designing" | "refining" = "designing"): void {
+	if (!ctx.hasUI || ctx.mode !== "tui") return;
+	const label = stage === "refining" ? "Refining goal contract…" : "Designing goal contract…";
+	ctx.ui.setStatus("pi-goal", ctx.ui.theme.fg("accent", `🎯 ${stage} • setup`));
+	ctx.ui.setWidget("pi-goal", [
+		ctx.ui.theme.fg("accent", `🎯 ${label}`),
+		ctx.ui.theme.fg("dim", "This usually takes 15–30 seconds. The approval overlay will open when ready."),
+	], { placement: "aboveEditor" });
+}
+
 export function updateGoalUi(ctx: ExtensionContext, state?: GoalState): void {
 	if (!ctx.hasUI || ctx.mode !== "tui") return;
 	if (!state || state.status === "completed" || state.status === "cancelled") {

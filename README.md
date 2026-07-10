@@ -19,7 +19,7 @@ Goal mode never weakens Pi's existing permission or confirmation gates. Workspac
 ## Install
 
 ```bash
-pi install npm:@misunders2d/pi-goal@1.0.0
+pi install npm:@misunders2d/pi-goal@1.0.1
 ```
 
 Try without installing:
@@ -31,7 +31,7 @@ pi -e npm:@misunders2d/pi-goal@1.0.0
 Pinned GitHub release:
 
 ```bash
-pi install git:github.com/misunders2d/pi-goal@v1.0.0
+pi install git:github.com/misunders2d/pi-goal@v1.0.1
 ```
 
 ## Use
@@ -48,7 +48,7 @@ Then:
 /goal Build and validate the requested outcome
 ```
 
-Review the generated outcome, done conditions, phases, verification checks, authority envelope, and interruption rules. Approve once. Bare `/goal` opens the full progress and control overlay.
+Pi immediately shows a persistent planning indicator while it designs the contract; this usually takes 15–30 seconds. Review the generated outcome, done conditions, phases, verification checks, authority envelope, and interruption rules. Approve once. Bare `/goal` opens the full progress and control overlay.
 
 Natural-language messages steer an active goal. The overlay provides pause, resume, cancel, blocker resolution, and exact pending-risk approval. In normal input, approve a displayed pending action only with `approve exact pending risk once`; broader approval wording does not grant authority.
 

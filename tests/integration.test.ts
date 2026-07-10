@@ -23,6 +23,8 @@ function makeHarness(root: string, mode = "tui") {
 	const tools = new Map<string, any>();
 	const messages: any[] = [];
 	const notifications: any[] = [];
+	const statuses: any[] = [];
+	const widgets: any[] = [];
 	const branch: any[] = [];
 	let aborts = 0;
 	const bus = new Map<string, Set<(data: unknown) => void>>();
@@ -51,13 +53,15 @@ function makeHarness(root: string, mode = "tui") {
 		sessionManager: { getSessionId: () => "session-integration", getBranch: () => branch },
 		ui: {
 			notify(message: string, type?: string) { notifications.push({ message, type }); },
-			setStatus() {}, setWidget() {}, setWorkingMessage() {},
+			setStatus(id: string, value?: unknown) { statuses.push({ id, value }); },
+			setWidget(id: string, value?: unknown, options?: unknown) { widgets.push({ id, value, options }); },
+			setWorkingMessage() {},
 			theme: { fg: (_color: string, text: string) => text },
 			custom: async () => "close", confirm: async () => true, editor: async () => undefined,
 		},
 	};
 	return {
-		pi, ctx, branch, commands, tools, messages, notifications, get aborts() { return aborts; },
+		pi, ctx, branch, commands, tools, messages, notifications, statuses, widgets, get aborts() { return aborts; },
 		async emit(name: string, event: any) { const results = []; for (const handler of handlers.get(name) ?? []) results.push(await handler(event, ctx)); return results; },
 		async command(name: string, args: string) { return commands.get(name).handler(args, ctx); },
 		async tool(name: string, params: any) { return tools.get(name).execute(`${name}-call`, params, undefined, undefined, ctx); },
@@ -89,6 +93,20 @@ test("registers only canonical /goal and rejects noninteractive starts", async (
 		await harness.command("goal", "Do work");
 		assert.match(harness.notifications.at(-1).message, /requires interactive Pi TUI/);
 		assert.equal(harness.branch.length, 0);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("goal setup immediately shows persistent planning feedback", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root);
+		const pending = harness.command("goal", "Check system health");
+		assert.match(JSON.stringify(harness.statuses), /designing/);
+		assert.match(JSON.stringify(harness.widgets), /Designing goal contract/);
+		assert.match(JSON.stringify(harness.widgets), /15–30 seconds/);
+		await pending;
+		assert.match(harness.notifications.at(-1).message, /requires an active model/);
+		assert.equal(harness.widgets.at(-1).value, undefined);
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 

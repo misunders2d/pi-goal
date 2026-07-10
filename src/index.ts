@@ -44,7 +44,7 @@ import type {
 	VerificationCheck,
 	VerificationResult,
 } from "./types.ts";
-import { showDetailOverlay, showSetupCard, updateGoalUi } from "./ui.ts";
+import { showDetailOverlay, showPlanningUi, showSetupCard, updateGoalUi } from "./ui.ts";
 import { runAllChecks } from "./verification.ts";
 
 const GOAL_TOOL_NAMES = new Set([
@@ -633,10 +633,11 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			refreshToolInfo();
+			showPlanningUi(ctx, "designing");
 			ctx.ui.setWorkingMessage("Designing complete goal contract…");
 			let draft: GoalDraft;
 			try { draft = await runWithRetries(() => isolated.plan(ctx, outcome, [...toolInfo.values()]), 2); }
-			catch (error) { ctx.ui.setWorkingMessage(); ctx.ui.notify(`Goal setup failed: ${error instanceof Error ? error.message : String(error)}`, "error"); return; }
+			catch (error) { ctx.ui.setWorkingMessage(); updateGoalUi(ctx, undefined); ctx.ui.notify(`Goal setup failed: ${error instanceof Error ? error.message : String(error)}`, "error"); return; }
 			ctx.ui.setWorkingMessage();
 			let state = createGoalState(draft, ctx);
 			store.set(state);
@@ -649,6 +650,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				if (action === "refine") {
 					const refinement = await ctx.ui.editor("Refine goal contract", "Describe what the contract should change. Do not paste secrets.");
 					if (!refinement?.trim()) continue;
+					showPlanningUi(ctx, "refining");
 					ctx.ui.setWorkingMessage("Refining goal contract…");
 					try {
 						draft = await runWithRetries(() => isolated.plan(ctx, outcome, [...toolInfo.values()], refinement), 2);
@@ -656,7 +658,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 						replacement.goalId = state.goalId; replacement.createdAt = state.createdAt; replacement.generation = state.generation + 1;
 						state = replacement; store.set(state); persist(ctx, "setup_refined", "user refined setup contract");
 					} catch (error) { ctx.ui.notify(`Goal refinement failed: ${error instanceof Error ? error.message : String(error)}`, "error"); }
-					finally { ctx.ui.setWorkingMessage(); }
+					finally { ctx.ui.setWorkingMessage(); updateGoalUi(ctx, state); }
 					continue;
 				}
 				state.status = "running"; state.phase = "executing"; state.approvedAt = now(); state.generation += 1; state.continuationSequence += 1;
