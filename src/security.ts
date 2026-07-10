@@ -1,6 +1,6 @@
 import { isAbsolute, relative, resolve } from "node:path";
 import type { ToolInfo } from "@earendil-works/pi-coding-agent";
-import { canonicalJson, inputHash, isSensitivePath, isWithinWorkspace } from "./state.ts";
+import { canonicalJson, inputHash, isSensitivePath, resolvedPathWithinWorkspace } from "./state.ts";
 import type { ActionAuthority, ActionClass, GoalState } from "./types.ts";
 
 export interface SafetyDecision {
@@ -17,6 +17,9 @@ const MUTATION_DESCRIPTION = /\b(create|update|write|delete|remove|send|upload|p
 const BACKGROUND_DESCRIPTION = /\b(background|detached|asynchronous|async job|reports? back|completion message)\b/i;
 const PATH_KEY = /(?:^|_)(?:path|file|filename|directory|dir|cwd|root|output|destination|local_path)$/i;
 const SECRET_KEY = /(?:secret|token|password|credential|private.?key|api.?key|authorization|cookie)/i;
+const SAFE_LOCAL_COMMANDS = new Set(["pwd", "ls", "cat", "head", "tail", "wc", "stat", "file", "sha256sum", "md5sum", "grep", "rg", "fd", "find", "sort", "uniq", "cut", "tr", "diff", "cmp", "test", "printf", "echo", "date", "uname", "which", "realpath", "readlink", "pi"]);
+const WORKSPACE_MUTATORS = new Set(["mkdir", "touch", "cp", "mv", "chmod", "truncate", "ln"]);
+const ARBITRARY_RUNTIMES = new Set(["node", "nodejs", "python", "python3", "perl", "ruby", "php", "deno", "bun", "npx", "tsx", "ts-node"]);
 
 export function toolDeclaresBackground(info: ToolInfo | undefined): boolean {
 	return !!info && BACKGROUND_DESCRIPTION.test(`${info.name} ${info.description ?? ""}`);
@@ -151,13 +154,23 @@ function obviousHardCommandRisk(command: string, cwd: string): string | undefine
 		if (executable === "find" && tokens.some((token) => /^(?:-delete|-exec|-execdir|-ok|-okdir)$/.test(token))) return "find mutation or command execution requires typed authority";
 		if (executable === "sed" && tokens.some((token) => token === "-i" || token.startsWith("--in-place"))) return "in-place file mutation requires typed authority";
 		if (["curl", "wget"].includes(executable)) return "network process requires typed authority";
-		if (["npm", "pnpm", "yarn"].includes(executable) && tokens.slice(1).some((token) => /^(?:install|i|add|publish|unpublish|deprecate|login|logout)$/.test(token))) return "package registry/install/publication action requires typed authority";
+		if (ARBITRARY_RUNTIMES.has(executable) && !tokens.slice(1).every((token) => /^(?:--version|-v)$/.test(token))) return `${executable} can execute arbitrary code and requires typed authority`;
+		if (["npm", "pnpm", "yarn"].includes(executable) && !tokens.slice(1).every((token) => /^(?:--version|-v)$/.test(token))) return `${executable} scripts can execute arbitrary code and require approved verification or typed authority`;
+		if (WORKSPACE_MUTATORS.has(executable)) {
+			const operands = tokens.slice(1).filter((token) => !token.startsWith("-"));
+			if (!operands.length || operands.some((token) => !resolvedPathWithinWorkspace(cwd, token))) return `${executable} target leaves the approved workspace`;
+		}
+		if (SAFE_LOCAL_COMMANDS.has(executable)) {
+			const operands = tokens.slice(1).filter((token) => !token.startsWith("-"));
+			if (operands.some((token) => !resolvedPathWithinWorkspace(cwd, token))) return `${executable} path leaves the approved workspace`;
+		}
+		if (!SAFE_LOCAL_COMMANDS.has(executable) && !WORKSPACE_MUTATORS.has(executable) && !ARBITRARY_RUNTIMES.has(executable) && !["npm", "pnpm", "yarn", "cd", "git", "systemctl"].includes(executable)) return `${executable} is outside the autonomous local-process allowlist`;
 		if (executable === "pip" && tokens[1] === "install") return "package installation requires typed authority";
 		if (executable === "git") {
 			const operationIndex = tokens[1] === "-C" ? 3 : 1;
 			if (tokens[1] === "-C") {
 				const target = tokens[2];
-				if (!target || !isWithinWorkspace(cwd, target)) return "git -C target leaves the approved workspace";
+				if (!target || !resolvedPathWithinWorkspace(cwd, target)) return "git -C target leaves the approved workspace";
 			}
 			const operation = tokens[operationIndex];
 			if (operation && !["status", "diff", "show", "log", "rev-parse", "ls-files", "grep"].includes(operation)) return `git ${operation} mutates or contacts repository state`;
@@ -186,7 +199,7 @@ function commandRisk(command: string, cwd: string, agentDir?: string): { risky: 
 		if (isExactReadOnlySystemctl(tokens)) continue;
 		if (executable === "cd") {
 			const target = tokens[1];
-			if (tokens.length !== 2 || !target || !isWithinWorkspace(cwd, target)) return { risky: true, reason: "cd target leaves the approved workspace", recoverable: true };
+			if (tokens.length !== 2 || !target || !resolvedPathWithinWorkspace(cwd, target)) return { risky: true, reason: "cd target leaves the approved workspace", recoverable: true };
 			continue;
 		}
 		if (ALWAYS_RISKY.has(executable)) return { risky: true, reason: `${executable} changes privileged, service, infrastructure, or remote state` };
@@ -200,7 +213,7 @@ function commandRisk(command: string, cwd: string, agentDir?: string): { risky: 
 			const operationIndex = tokens[1] === "-C" ? 3 : 1;
 			if (tokens[1] === "-C") {
 				const target = tokens[2];
-				if (!target || !isWithinWorkspace(cwd, target)) return { risky: true, reason: "git -C target leaves the approved workspace" };
+				if (!target || !resolvedPathWithinWorkspace(cwd, target)) return { risky: true, reason: "git -C target leaves the approved workspace" };
 			}
 			const operation = tokens[operationIndex];
 			if (operation && !["status", "diff", "show", "log", "rev-parse", "ls-files", "grep"].includes(operation)) {
@@ -223,11 +236,14 @@ export function classifyToolCall(
 	const paths = extractPaths(input);
 	if (paths.some(isSensitivePath)) return { allow: false, reason: "secret/auth/key paths are outside goal evidence authority", actionClass: "workspace_read", recoverable: true };
 	if (paths.some((path) => isGoalPrivatePath(state.cwd, agentDir, path))) return { allow: false, reason: "goal-private state is not worker-readable", actionClass: "workspace_read", recoverable: true };
-
-	if (toolName === "write" || toolName === "edit") {
-		if (paths.some((path) => !isWithinWorkspace(state.cwd, path))) return { allow: false, reason: "write/edit target leaves the approved workspace", actionClass: "workspace_write" };
-		return { allow: true, actionClass: "workspace_write" };
+	const resolvedPaths = paths.map((path) => resolvedPathWithinWorkspace(state.cwd, path));
+	if (paths.length && resolvedPaths.some((path) => !path)) {
+		const writeLike = toolName === "write" || toolName === "edit";
+		return { allow: false, reason: "tool path leaves the approved workspace or traverses a symlink boundary", actionClass: writeLike ? "workspace_write" : "workspace_read", recoverable: writeLike ? undefined : true };
 	}
+	if (resolvedPaths.some((path) => path && isSensitivePath(path))) return { allow: false, reason: "tool path resolves to a secret/auth/key target", actionClass: "workspace_read", recoverable: true };
+
+	if (toolName === "write" || toolName === "edit") return { allow: true, actionClass: "workspace_write" };
 	if (["read", "grep", "find", "ls"].includes(toolName)) return { allow: true, actionClass: "workspace_read" };
 	if (toolName === "bash") {
 		const command = typeof input.command === "string" ? input.command : "";

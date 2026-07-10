@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	GOAL_SCHEMA_VERSION,
@@ -83,9 +83,38 @@ export function isWithinWorkspace(cwd: string, path: string): boolean {
 	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
+function resolvedThroughExistingAncestor(path: string): string | undefined {
+	let cursor = resolve(path);
+	const suffix: string[] = [];
+	while (true) {
+		try { lstatSync(cursor); }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+			const parent = dirname(cursor);
+			if (parent === cursor) return undefined;
+			suffix.unshift(basename(cursor));
+			cursor = parent;
+			continue;
+		}
+		try { return resolve(realpathSync.native(cursor), ...suffix); }
+		catch { return undefined; }
+	}
+}
+
+export function resolvedPathWithinWorkspace(cwd: string, path: string): string | undefined {
+	if (!isWithinWorkspace(cwd, path)) return undefined;
+	const root = resolvedThroughExistingAncestor(cwd);
+	const target = resolvedThroughExistingAncestor(resolve(cwd, path));
+	if (!root || !target) return undefined;
+	const rel = relative(root, target);
+	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel)) ? target : undefined;
+}
+
 export function safeEvidencePath(cwd: string, path: string): string {
 	if (isSensitivePath(path)) return "[sensitive-path-redacted]";
-	if (!isWithinWorkspace(cwd, path)) return "[outside-workspace]";
+	const resolved = resolvedPathWithinWorkspace(cwd, path);
+	if (!resolved) return "[outside-workspace]";
+	if (isSensitivePath(resolved)) return "[sensitive-path-redacted]";
 	return relative(resolve(cwd), resolve(cwd, path)) || ".";
 }
 

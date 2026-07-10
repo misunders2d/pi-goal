@@ -68,11 +68,16 @@ export function verificationRecoveryWindow(startedAt: string | undefined, atMs =
 	return { elapsedMs, timedOut: elapsedMs >= maxMs };
 }
 
+export function isExplicitGoalSteeringInput(text: string): boolean {
+	return /^(?:steer|amend|change|revise|update)\s+(?:the\s+)?goal\b|^(?:also|additionally)\s+(?:add|include|require|remove|exclude)\b|^(?:new|changed)\s+requirement\s*:/i.test(text.trim());
+}
+
 export function isInformationalGoalInput(text: string): boolean {
 	const normalized = text.trim();
-	if (!normalized) return false;
-	return /^(?:why|what|how|where|when|who)\b/i.test(normalized)
-		|| /^(?:show|explain|summarize)\b.*\b(?:status|progress|goal|recovering|recovery|blocked|verification)\b/i.test(normalized)
+	if (!normalized || isExplicitGoalSteeringInput(normalized)) return false;
+	return normalized.endsWith("?")
+		|| /^(?:so\b|why|what|how|where|when|who|is|are|am|was|were|do|does|did|have|has|anything)\b/i.test(normalized)
+		|| /^(?:show|explain|summarize)\b.*\b(?:status|progress|goal|recovering|recovery|blocked|verification|audit)\b/i.test(normalized)
 		|| /^(?:status|progress)(?:\s|\?|$)/i.test(normalized);
 }
 
@@ -567,6 +572,14 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			});
 			return;
 		}
+		await mutex.run(() => {
+			const state = load(ctx);
+			if (!state || state.goalId !== goalId || state.generation !== generation || state.continuationSequence !== sequence) return;
+			state.currentAction = "Independent isolated audit";
+			state.nextAction = "Await verdict; each model attempt is limited to 90 seconds";
+			persist(ctx, "audit_model_started", "isolated auditor started with a bounded deadline");
+			snapshot = structuredClone(state);
+		});
 
 		let audit: AuditDecision;
 		try { audit = await runWithRetries(() => isolated.audit(ctx, snapshot!, checks), 2); }
@@ -1022,6 +1035,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 
 	pi.on("input", async (event, ctx) => {
 		let abortActive = false;
+		let abortIsolatedOnly = false;
 		const result = await mutex.run(() => {
 			if (event.source === "extension" || event.text.trim().startsWith("/goal")) return;
 			const state = load(ctx); if (!isActiveGoal(state)) return;
@@ -1053,12 +1067,15 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			}
 			if (isInformationalGoalInput(text)) return;
 			const cleaned = redactText(text, 2_000);
+			const auditWasActive = state.status === "auditing";
 			clearVerificationFailure(state);
 			state.outcome.amendments.push({ id: makeId("steering"), text: cleaned.text, createdAt: now() }); state.generation += 1; state.continuationSequence += 1; state.lastContinuationKey = undefined; state.completionCandidate = false; state.currentAction = "Applying user steering"; state.nextAction = cleaned.text;
-			persist(ctx, "user_steering", "user supplied natural-language steering");
+			if (auditWasActive) { state.status = "running"; state.phase = "planning"; abortIsolatedOnly = true; }
+			persist(ctx, "user_steering", auditWasActive ? "explicit user steering invalidated active audit" : "user supplied natural-language steering");
 			if (state.status === "paused" || state.status === "interrupted") return { action: "handled" as const };
 		});
 		if (abortActive) { ctx.abort(); await isolated.abortAll(); }
+		else if (abortIsolatedOnly) await isolated.abortAll();
 		return result;
 	});
 

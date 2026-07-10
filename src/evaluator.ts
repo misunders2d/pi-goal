@@ -102,7 +102,8 @@ function safeToolCatalog(tools: ToolInfo[]): Array<{ name: string; description: 
 
 const PROCESS_ONLY_AUDIT_CRITERIA = [
 	/(?:submitted|reviewed|accepted|approved)\s+(?:to|by)\s+(?:the\s+)?(?:independent\s+)?(?:verifier(?:\s*\/\s*auditor)?|auditor|audit)/i,
-	/(?:auditor|verifier|audit)\s+(?:confirms|validates|accepts|approves|completes)\b/i,
+	/(?:auditor|verifier|audit)\s+(?:confirms|validates|accepts|approves|completes|reports|returns|says|declares)\b(?:.{0,40}\b(?:pass|passed|success|successful|complete|completed|done|approved))?/i,
+	/\b(?:complete|completed|done|successful|success)\b.{0,60}\b(?:when|if|once|after)\b.{0,60}\b(?:auditor|verifier|audit)\b/i,
 ];
 
 export const SETUP_PLANNER_SYSTEM_PROMPT = `You are the isolated setup planner for Pi goal mode. First decide whether the user's intended target, scope, outcome, and material success conditions are clear enough to define one faithful executable contract. If multiple materially different contracts are plausible, or a missing answer would change the work or completion criteria, ask concise clarification questions instead of guessing. Never infer unclear intent by inspecting the workspace. The planner has no workspace tools. A vague request such as "testing the goal mode" requires clarification about what behavior or lifecycle the user wants tested.
@@ -271,6 +272,24 @@ interface IsolatedOptions {
 	tools?: string[];
 	customTools?: ToolDefinition[];
 	thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high";
+	timeoutMs?: number;
+}
+
+export async function withDeadline<T>(work: Promise<T>, timeoutMs: number, onTimeout?: () => void | Promise<void>): Promise<T> {
+	let timer: NodeJS.Timeout | undefined;
+	try {
+		return await Promise.race([
+			work,
+			new Promise<T>((_resolve, reject) => {
+				timer = setTimeout(() => {
+					void Promise.resolve(onTimeout?.()).catch(() => undefined);
+					reject(new Error(`isolated model timed out after ${timeoutMs}ms`));
+				}, timeoutMs);
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
 }
 
 export class IsolatedModelRunner {
@@ -319,7 +338,7 @@ export class IsolatedModelRunner {
 		});
 		this.active.add(session);
 		try {
-			await session.prompt(options.prompt);
+			await withDeadline(session.prompt(options.prompt), options.timeoutMs ?? 90_000, () => session.abort());
 			const text = assistantText(session.messages);
 			if (!text.trim()) throw new Error("isolated model returned no output");
 			return text;
@@ -348,7 +367,7 @@ export class IsolatedModelRunner {
 			availableTools: safeToolCatalog(tools),
 		});
 		return normalizePlanningResult(
-			parseJsonObject(await this.run({ ctx, systemPrompt, prompt, tools: [], thinkingLevel: "medium" })),
+			parseJsonObject(await this.run({ ctx, systemPrompt, prompt, tools: [], thinkingLevel: "medium", timeoutMs: 120_000 })),
 			outcome,
 			ctx.cwd,
 		);
@@ -367,7 +386,7 @@ export class IsolatedModelRunner {
 			interrupt: state.interrupt,
 			latestTurn: redactText(latestTurn, 4_000).text,
 		});
-		const decision = parseJsonObject<EvaluatorDecision>(await this.run({ ctx, systemPrompt, prompt, tools: [], thinkingLevel: "low" }));
+		const decision = parseJsonObject<EvaluatorDecision>(await this.run({ ctx, systemPrompt, prompt, tools: [], thinkingLevel: "low", timeoutMs: 60_000 }));
 		if (!new Set(["continue", "recover", "verify", "interrupt", "complete_candidate"]).has(decision.action)) throw new Error("evaluator returned invalid action");
 		if (typeof decision.reason !== "string" || typeof decision.currentAction !== "string" || typeof decision.nextAction !== "string") throw new Error("evaluator returned incomplete decision");
 		return decision;
@@ -388,6 +407,6 @@ export class IsolatedModelRunner {
 			activeInterrupt: state.interrupt,
 			backgroundWork: Object.keys(state.backgroundWork),
 		});
-		return normalizeAuditDecision(parseJsonObject<unknown>(await this.run({ ctx, systemPrompt, prompt, tools: ["read", "grep", "ls", "pi_goal_run_check"], customTools: [checkTool], thinkingLevel: "medium" })));
+		return normalizeAuditDecision(parseJsonObject<unknown>(await this.run({ ctx, systemPrompt, prompt, tools: ["read", "grep", "ls", "pi_goal_run_check"], customTools: [checkTool], thinkingLevel: "medium", timeoutMs: 90_000 })));
 	}
 }

@@ -3,8 +3,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { IsolatedModelRunner, SETUP_PLANNER_SYSTEM_PROMPT, normalizeAuditDecision, normalizeDraft, normalizePlanningResult } from "../src/evaluator.ts";
-import piGoalExtension, { isInformationalGoalInput, validateAuditCompletion, verificationRecoveryWindow } from "../src/index.ts";
+import { IsolatedModelRunner, SETUP_PLANNER_SYSTEM_PROMPT, normalizeAuditDecision, normalizeDraft, normalizePlanningResult, withDeadline } from "../src/evaluator.ts";
+import piGoalExtension, { isExplicitGoalSteeringInput, isInformationalGoalInput, validateAuditCompletion, verificationRecoveryWindow } from "../src/index.ts";
 import { STATE_CUSTOM_TYPE, createGoalState, sha256 } from "../src/state.ts";
 import type { GoalDraft } from "../src/types.ts";
 
@@ -428,17 +428,50 @@ test("completion preflight defects stay in execution instead of normalizing reco
 test("informational goal questions do not mutate generation or become steering", async () => {
 	assert.equal(isInformationalGoalInput('why is it "recovering" again?'), true);
 	assert.equal(isInformationalGoalInput("what is the goal status?"), true);
+	assert.equal(isInformationalGoalInput("so? is anything happening?"), true);
+	assert.equal(isInformationalGoalInput("are you done?"), true);
 	assert.equal(isInformationalGoalInput("Also verify documentation"), false);
+	assert.equal(isExplicitGoalSteeringInput("steer goal: also add documentation"), true);
 	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
 	try {
 		const harness = makeHarness(root);
 		const initial = injectRunning(harness);
-		const results = await harness.emit("input", { type: "input", source: "interactive", text: 'why is it "recovering" again?' });
-		assert.equal(results.find(Boolean), undefined);
+		for (const text of ['why is it "recovering" again?', "so? is anything happening?", "are you done?"]) {
+			const results = await harness.emit("input", { type: "input", source: "interactive", text });
+			assert.equal(results.find(Boolean), undefined);
+		}
 		const persisted = latestState(harness);
 		assert.equal(persisted.generation, initial.generation);
 		assert.equal(persisted.outcome.amendments.length, 0);
 	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("audit-time questions are non-mutating while explicit steering exits auditing atomically", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-audit-input-"));
+	try {
+		const harness = makeHarness(root);
+		const state = createGoalState(draft, harness.ctx);
+		state.status = "auditing"; state.phase = "auditing"; state.completionCandidate = true;
+		harness.branch.push({ type: "custom", customType: STATE_CUSTOM_TYPE, data: state });
+		await harness.emit("input", { type: "input", source: "interactive", text: "so? is anything happening?" });
+		let persisted = latestState(harness);
+		assert.equal(persisted.generation, state.generation);
+		assert.equal(persisted.status, "auditing");
+		assert.equal(persisted.outcome.amendments.length, 0);
+		await harness.emit("input", { type: "input", source: "interactive", text: "steer goal: add documentation" });
+		persisted = latestState(harness);
+		assert.equal(persisted.generation, state.generation + 1);
+		assert.equal(persisted.status, "running");
+		assert.equal(persisted.phase, "planning");
+		assert.equal(persisted.completionCandidate, false);
+		assert.equal(persisted.outcome.amendments.length, 1);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("isolated model deadline rejects never-resolving work and invokes abort", async () => {
+	let aborted = false;
+	await assert.rejects(() => withDeadline(new Promise<never>(() => {}), 10, () => { aborted = true; }), /timed out after 10ms/);
+	assert.equal(aborted, true);
 });
 
 test("verification recovery timeout boundary is deterministic without wall-clock waiting", () => {
@@ -521,6 +554,7 @@ test("explicit unknown evidence IDs fail before state mutation", async () => {
 
 test("planner rejects circular audit-process criteria before approval", () => {
 	assert.match(SETUP_PLANNER_SYSTEM_PROMPT, /Never add criteria about submitting completion/);
+	assert.throws(() => normalizeDraft({ ...draft, criteria: ["The goal is complete when the isolated auditor reports pass"] }, draft.outcome), /process-only audit criteria/);
 	assert.throws(() => normalizeDraft({
 		outcome: "Create READY.md",
 		criteria: ["READY.md exists", "Completion is submitted to the independent verifier/auditor and accepted before finishing."],

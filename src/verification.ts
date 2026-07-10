@@ -1,9 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute } from "node:path";
 import { spawn } from "node:child_process";
 import { Type } from "typebox";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { isSensitivePath, isWithinWorkspace, redactText, safeEvidencePath } from "./state.ts";
+import { isSensitivePath, redactText, resolvedPathWithinWorkspace, safeEvidencePath } from "./state.ts";
 import type { GoalState, VerificationCheck, VerificationResult } from "./types.ts";
 
 const DENIED_EXECUTABLES = new Set([
@@ -24,10 +24,13 @@ function runProcess(
 	cwd: string,
 	timeoutMs: number,
 	signal?: AbortSignal,
-): Promise<{ exitCode: number; durationMs: number; stdout: string }> {
+): Promise<{ exitCode: number; durationMs: number; stdout: string; timedOut: boolean; aborted: boolean; signal?: string }> {
 	return new Promise((resolvePromise, reject) => {
 		const started = Date.now();
 		let settled = false;
+		let timedOut = false;
+		let aborted = false;
+		let forceKill: NodeJS.Timeout | undefined;
 		const child = spawn(executable, args, {
 			cwd,
 			shell: false,
@@ -36,29 +39,36 @@ function runProcess(
 		});
 		let bytes = 0;
 		let stdout = "";
+		const terminate = () => {
+			child.kill("SIGTERM");
+			forceKill = setTimeout(() => child.kill("SIGKILL"), 1_000);
+		};
 		const consume = (chunk: Buffer, capture: boolean) => {
 			bytes += chunk.length;
 			if (capture && stdout.length < 1_000_000) stdout += chunk.toString("utf8").slice(0, 1_000_000 - stdout.length);
-			if (bytes > 2_000_000) child.kill("SIGTERM");
+			if (bytes > 2_000_000) terminate();
 		};
 		child.stdout?.on("data", (chunk: Buffer) => consume(chunk, true));
 		child.stderr?.on("data", (chunk: Buffer) => consume(chunk, false));
-		const timer = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
-		const abort = () => child.kill("SIGTERM");
+		const timer = setTimeout(() => { timedOut = true; terminate(); }, timeoutMs);
+		const abort = () => { aborted = true; terminate(); };
 		signal?.addEventListener("abort", abort, { once: true });
+		const cleanup = () => {
+			clearTimeout(timer);
+			if (forceKill) clearTimeout(forceKill);
+			signal?.removeEventListener("abort", abort);
+		};
 		child.on("error", (error) => {
 			if (settled) return;
 			settled = true;
-			clearTimeout(timer);
-			signal?.removeEventListener("abort", abort);
+			cleanup();
 			reject(error);
 		});
-		child.on("close", (code) => {
+		child.on("close", (code, closeSignal) => {
 			if (settled) return;
 			settled = true;
-			clearTimeout(timer);
-			signal?.removeEventListener("abort", abort);
-			resolvePromise({ exitCode: typeof code === "number" ? code : 128, durationMs: Date.now() - started, stdout });
+			cleanup();
+			resolvePromise({ exitCode: typeof code === "number" ? code : 128, durationMs: Date.now() - started, stdout, timedOut, aborted, signal: closeSignal ?? undefined });
 		});
 	});
 }
@@ -77,8 +87,10 @@ function jsonPointer(value: unknown, pointer: string): unknown {
 
 function checkedPath(cwd: string, path: string): string {
 	if (isSensitivePath(path)) throw new Error("verification path is secret-like and cannot be inspected");
-	if (!isWithinWorkspace(cwd, path)) throw new Error("verification path leaves the approved workspace");
-	return resolve(cwd, path);
+	const resolved = resolvedPathWithinWorkspace(cwd, path);
+	if (!resolved) throw new Error("verification path leaves the approved workspace");
+	if (isSensitivePath(resolved)) throw new Error("verification path resolves to a secret-like target");
+	return resolved;
 }
 
 export function validateVerificationCheckDefinition(check: VerificationCheck, workspace: string): void {
@@ -144,7 +156,15 @@ export async function runVerificationCheck(check: VerificationCheck, workspace: 
 				const { executable, cwd } = validateExecutable(check, workspace);
 				const result = await runProcess(executable, check.args, cwd, Math.max(1_000, Math.min(check.timeoutMs ?? 120_000, 900_000)), signal);
 				const expected = check.expectedExitCode ?? 0;
-				return { checkId: check.id, passed: result.exitCode === expected, summary: result.exitCode === expected ? `command exited ${expected}` : `command exited ${result.exitCode}; expected ${expected}`, exitCode: result.exitCode, durationMs: result.durationMs };
+				const passed = !result.timedOut && !result.aborted && result.exitCode === expected;
+				const summary = result.timedOut
+					? `command timed out after ${result.durationMs}ms`
+					: result.aborted
+						? "command aborted"
+						: result.signal
+							? `command terminated by ${result.signal}`
+							: passed ? `command exited ${expected}` : `command exited ${result.exitCode}; expected ${expected}`;
+				return { checkId: check.id, passed, summary, exitCode: result.exitCode, timedOut: result.timedOut || undefined, aborted: result.aborted || undefined, signal: result.signal, durationMs: result.durationMs };
 			}
 			case "git_status": {
 				const result = await runProcess("git", ["status", "--porcelain"], workspace, 30_000, signal);

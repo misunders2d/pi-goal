@@ -295,5 +295,8 @@ export interface VerificationResult {
 	passed: boolean;
 	summary: string;
 	exitCode?: number;
+	timedOut?: boolean;
+	aborted?: boolean;
+	signal?: string;
 	durationMs: number;
 }

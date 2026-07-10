@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -63,6 +63,34 @@ test("verification runner denies shells, sensitive paths, and workspace escape",
 			assert.equal((await runVerificationCheck({ id: `npm-${operation}`, kind: "command_exit", label: operation, executable: "npm", args: [operation, "noop"] }, root)).passed, false);
 		}
 		assert.equal((await runVerificationCheck({ id: "V5", kind: "command_exit", label: "git mutate", executable: "git", args: ["commit", "-m", "bad"] }, root)).passed, false);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("verification rejects symlinks that resolve outside goal cwd", async () => {
+	const base = mkdtempSync(join(tmpdir(), "pi-goal-symlink-"));
+	try {
+		const inside = join(base, "inside");
+		const outside = join(base, "outside");
+		mkdirSync(inside); mkdirSync(outside);
+		writeFileSync(join(outside, "secret.txt"), "OUTSIDE\n");
+		symlinkSync(join(outside, "secret.txt"), join(inside, "link.txt"));
+		symlinkSync(join(outside, "missing.txt"), join(inside, "broken-link.txt"));
+		const result = await runVerificationCheck({ id: "LINK", kind: "file_contains", label: "link", path: "link.txt", pattern: "OUTSIDE" }, inside);
+		const broken = await runVerificationCheck({ id: "BROKEN", kind: "file_exists", label: "broken", path: "broken-link.txt" }, inside);
+		assert.equal(result.passed, false);
+		assert.equal(broken.passed, false);
+		assert.match(result.summary, /leaves the approved workspace/);
+		assert.match(broken.summary, /leaves the approved workspace/);
+	} finally { rmSync(base, { recursive: true, force: true }); }
+});
+
+test("command timeout is explicit and distinct from ordinary exit", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-timeout-"));
+	try {
+		const result = await runVerificationCheck({ id: "TIME", kind: "command_exit", label: "timeout", executable: "node", args: ["-e", "setTimeout(()=>{},5000)"], timeoutMs: 1000 }, root);
+		assert.equal(result.passed, false);
+		assert.equal(result.timedOut, true);
+		assert.match(result.summary, /timed out after/);
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
