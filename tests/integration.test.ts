@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { IsolatedModelRunner, SETUP_PLANNER_SYSTEM_PROMPT, normalizeAuditDecision, normalizeDraft } from "../src/evaluator.ts";
+import { IsolatedModelRunner, SETUP_PLANNER_SYSTEM_PROMPT, normalizeAuditDecision, normalizeDraft, normalizePlanningResult } from "../src/evaluator.ts";
 import piGoalExtension, { validateAuditCompletion } from "../src/index.ts";
 import { STATE_CUSTOM_TYPE, createGoalState, sha256 } from "../src/state.ts";
 import type { GoalDraft } from "../src/types.ts";
@@ -102,12 +102,71 @@ test("goal setup immediately shows persistent planning feedback", async () => {
 		const harness = makeHarness(root);
 		const pending = harness.command("goal", "Check system health");
 		assert.match(JSON.stringify(harness.statuses), /designing/);
-		assert.match(JSON.stringify(harness.widgets), /Designing goal contract/);
-		assert.match(JSON.stringify(harness.widgets), /15–30 seconds/);
+		assert.match(JSON.stringify(harness.widgets), /Checking clarity and designing goal contract/);
+		assert.match(JSON.stringify(harness.widgets), /ask before creating the contract/);
 		await pending;
 		assert.match(harness.notifications.at(-1).message, /requires an active model/);
 		assert.equal(harness.widgets.at(-1).value, undefined);
 	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("planner requests clarification without workspace tools", async () => {
+	const runner = new IsolatedModelRunner("/tmp/pi-goal-test-agent");
+	let options: any;
+	(runner as any).run = async (value: unknown) => {
+		options = value;
+		return JSON.stringify({ status: "needs_clarification", questions: ["Which goal-mode lifecycle should be tested?"] });
+	};
+	const result = await runner.plan({ cwd: "/tmp/workspace" } as any, "testing the goal mode", []);
+	assert.deepEqual(result, { kind: "clarification", questions: ["Which goal-mode lifecycle should be tested?"] });
+	assert.deepEqual(options.tools, []);
+	assert.match(options.systemPrompt, /Never infer unclear intent by inspecting the workspace/);
+});
+
+test("planning result is fail-closed and accepts only clarification or a complete ready contract", () => {
+	assert.deepEqual(
+		normalizePlanningResult({ status: "needs_clarification", questions: ["Target?", "Scope?", "Success condition?", "Extra?"] }, "Do work"),
+		{ kind: "clarification", questions: ["Target?", "Scope?", "Success condition?"] },
+	);
+	assert.throws(() => normalizePlanningResult({ status: "needs_clarification", questions: [] }, "Do work"), /without a question/);
+	assert.throws(() => normalizePlanningResult({ status: "ready" }, "Do work"), /no goal draft/);
+	assert.throws(() => normalizePlanningResult({ outcome: "guessed" }, "Do work"), /invalid planning status/);
+	const ready = normalizePlanningResult({
+		status: "ready",
+		contract: {
+			outcome: "Create READY.md",
+			criteria: ["READY.md exists"],
+			phases: [{ id: "P1", title: "Create file", criterionIds: ["AC1"] }],
+			verificationChecks: [{ id: "V1", kind: "file_exists", label: "READY.md exists", path: "READY.md" }],
+			authorities: [], constraints: [], nonGoals: [],
+		},
+	}, "Create READY.md");
+	assert.equal(ready.kind, "draft");
+});
+
+test("ambiguous goal setup asks before creating or persisting a contract", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	const originalPlan = IsolatedModelRunner.prototype.plan;
+	try {
+		const harness = makeHarness(root);
+		let calls = 0;
+		IsolatedModelRunner.prototype.plan = async (_ctx, _outcome, _tools, _refinement, clarifications = []) => {
+			calls += 1;
+			assert.equal(harness.branch.length, 0, "setup state must not persist before clarification completes");
+			if (!clarifications.length) return { kind: "clarification", questions: ["Which goal-mode lifecycle should be tested?"] };
+			assert.equal(clarifications[0]?.answer, "Full end-to-end lifecycle");
+			return { kind: "draft", draft };
+		};
+		harness.ctx.ui.editor = async (_title: string, prefilled: string) => `${prefilled}Full end-to-end lifecycle`;
+		harness.ctx.ui.custom = async () => "cancel";
+		await harness.command("goal", "testing the goal mode");
+		assert.equal(calls, 2);
+		assert.match(JSON.stringify(harness.widgets), /Goal clarification needed/);
+		assert.equal(latestState(harness).status, "cancelled");
+	} finally {
+		IsolatedModelRunner.prototype.plan = originalPlan;
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 test("restores running state, injects it every turn, and blocks out-of-workspace mutation", async () => {

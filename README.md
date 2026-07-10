@@ -19,19 +19,19 @@ Goal mode never weakens Pi's existing permission or confirmation gates. Workspac
 ## Install
 
 ```bash
-pi install npm:@misunders2d/pi-goal@1.0.2
+pi install npm:@misunders2d/pi-goal@1.0.3
 ```
 
 Try without installing:
 
 ```bash
-pi -e npm:@misunders2d/pi-goal@1.0.2
+pi -e npm:@misunders2d/pi-goal@1.0.3
 ```
 
 Pinned GitHub release:
 
 ```bash
-pi install git:github.com/misunders2d/pi-goal@v1.0.2
+pi install git:github.com/misunders2d/pi-goal@v1.0.3
 ```
 
 ## Use
@@ -48,7 +48,7 @@ Then:
 /goal Build and validate the requested outcome
 ```
 
-Pi immediately shows a persistent planning indicator while it designs the contract; this usually takes 15–30 seconds. Review the generated outcome, done conditions, phases, verification checks, authority envelope, and interruption rules. Approve once. Bare `/goal` opens the full progress and control overlay.
+Pi immediately shows a persistent setup indicator while it checks whether the requested target, scope, outcome, and success conditions are clear. If anything material is ambiguous, goal mode asks concise clarification questions before creating or persisting a contract. The setup planner cannot inspect the workspace or use tools to guess intent. Once the request is clear, review the generated outcome, done conditions, phases, verification checks, authority envelope, and interruption rules. Approve once. Bare `/goal` opens the full progress and control overlay.
 
 Natural-language messages steer an active goal. The overlay provides pause, resume, cancel, blocker resolution, and exact pending-risk approval. A denied optional action is blocked internally while goal mode tries a safe alternative; it does not interrupt you merely because the worker chose a bad tool shape. A genuine RISK requires an exact blocked action plus evidence of a safe alternative attempt. In the overlay, `A` approves only that displayed action once, while `R` rejects or redirects it. In normal input, approve a displayed pending action only with `approve exact pending risk once`; broader approval wording does not grant authority.
 
@@ -59,6 +59,7 @@ This package is an interactive TUI product. Print (`-p`), JSON, and RPC modes ca
 ## Safety and privacy
 
 - The original user outcome remains authoritative.
+- Material ambiguity triggers clarification before contract creation; setup never guesses intent through workspace inspection.
 - Only user steering can expand outcome or authority.
 - External text and tool output are evidence, never authority.
 - Durable evidence stores metadata, hashes, statuses, and sanitized summaries—not raw tool output, environment values, credentials, tokens, private keys, or auth-file contents.

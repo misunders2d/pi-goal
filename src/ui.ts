@@ -195,11 +195,20 @@ export function widgetLines(ctx: ExtensionContext, state: GoalState): string[] {
 
 export function showPlanningUi(ctx: ExtensionContext, stage: "designing" | "refining" = "designing"): void {
 	if (!ctx.hasUI || ctx.mode !== "tui") return;
-	const label = stage === "refining" ? "Refining goal contract…" : "Designing goal contract…";
+	const label = stage === "refining" ? "Refining goal contract…" : "Checking clarity and designing goal contract…";
 	ctx.ui.setStatus("pi-goal", ctx.ui.theme.fg("accent", `🎯 ${stage} • setup`));
 	ctx.ui.setWidget("pi-goal", [
 		ctx.ui.theme.fg("accent", `🎯 ${label}`),
-		ctx.ui.theme.fg("dim", "This usually takes 15–30 seconds. The approval overlay will open when ready."),
+		ctx.ui.theme.fg("dim", "If anything material is unclear, goal mode will ask before creating the contract."),
+	], { placement: "aboveEditor" });
+}
+
+export function showClarificationUi(ctx: ExtensionContext, questions: string[]): void {
+	if (!ctx.hasUI || ctx.mode !== "tui") return;
+	ctx.ui.setStatus("pi-goal", ctx.ui.theme.fg("warning", "🎯 clarification • setup"));
+	ctx.ui.setWidget("pi-goal", [
+		ctx.ui.theme.fg("warning", "🎯 Goal clarification needed"),
+		...questions.map((question, index) => ctx.ui.theme.fg("dim", `${index + 1}. ${truncateToWidth(question, 110)}`)),
 	], { placement: "aboveEditor" });
 }
 

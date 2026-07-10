@@ -246,6 +246,15 @@ export interface GoalDraft {
 	nonGoals: string[];
 }
 
+export interface GoalClarificationExchange {
+	questions: string[];
+	answer: string;
+}
+
+export type GoalPlanningResult =
+	| { kind: "clarification"; questions: string[] }
+	| { kind: "draft"; draft: GoalDraft };
+
 export interface GoalEventRecord {
 	schemaVersion: typeof GOAL_SCHEMA_VERSION;
 	goalId: string;

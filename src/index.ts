@@ -34,6 +34,7 @@ import type {
 	AuditDecision,
 	EvaluatorDecision,
 	EvidenceRecord,
+	GoalClarificationExchange,
 	GoalCriterion,
 	GoalDraft,
 	GoalInterrupt,
@@ -43,7 +44,7 @@ import type {
 	VerificationCheck,
 	VerificationResult,
 } from "./types.ts";
-import { showDetailOverlay, showPlanningUi, showSetupCard, updateGoalUi } from "./ui.ts";
+import { showClarificationUi, showDetailOverlay, showPlanningUi, showSetupCard, updateGoalUi } from "./ui.ts";
 import { runAllChecks } from "./verification.ts";
 
 const GOAL_TOOL_NAMES = new Set([
@@ -378,6 +379,32 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		throw last;
 	}
 
+	async function designGoalContract(ctx: ExtensionCommandContext, outcome: string, refinement?: string): Promise<GoalDraft | undefined> {
+		const clarifications: GoalClarificationExchange[] = [];
+		for (let round = 0; round < 3; round += 1) {
+			showPlanningUi(ctx, refinement ? "refining" : "designing");
+			ctx.ui.setWorkingMessage(round ? "Applying goal clarification…" : refinement ? "Refining goal contract…" : "Checking clarity and designing goal contract…");
+			const result = await runWithRetries(
+				() => isolated.plan(ctx, outcome, [...toolInfo.values()], refinement, clarifications),
+				2,
+			);
+			ctx.ui.setWorkingMessage();
+			if (result.kind === "draft") return result.draft;
+
+			showClarificationUi(ctx, result.questions);
+			const template = `Questions:\n${result.questions.map((question, index) => `${index + 1}. ${question}`).join("\n")}\n\nAnswers:\n`;
+			let answer: string | undefined;
+			while (!answer) {
+				const response = await ctx.ui.editor("Clarify goal before contract creation", template);
+				if (response === undefined) return undefined;
+				answer = (response.startsWith(template) ? response.slice(template.length) : response).trim();
+				if (!answer) ctx.ui.notify("Please answer the clarification question(s), or press Escape to cancel goal setup.", "warning");
+			}
+			clarifications.push({ questions: result.questions, answer });
+		}
+		throw new Error("goal remains materially unclear after three clarification rounds; restart /goal with a more specific outcome");
+	}
+
 	async function finishAudit(ctx: ExtensionContext, goalId: string, generation: number, sequence: number): Promise<void> {
 		let snapshot: GoalState | undefined;
 		await mutex.run(() => {
@@ -642,12 +669,11 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			refreshToolInfo();
-			showPlanningUi(ctx, "designing");
-			ctx.ui.setWorkingMessage("Designing complete goal contract…");
-			let draft: GoalDraft;
-			try { draft = await runWithRetries(() => isolated.plan(ctx, outcome, [...toolInfo.values()]), 2); }
+			let draft: GoalDraft | undefined;
+			try { draft = await designGoalContract(ctx, outcome); }
 			catch (error) { ctx.ui.setWorkingMessage(); updateGoalUi(ctx, undefined); ctx.ui.notify(`Goal setup failed: ${error instanceof Error ? error.message : String(error)}`, "error"); return; }
 			ctx.ui.setWorkingMessage();
+			if (!draft) { updateGoalUi(ctx, undefined); ctx.ui.notify("Goal setup cancelled before contract creation.", "info"); return; }
 			let state = createGoalState(draft, ctx);
 			store.set(state);
 			persist(ctx, "setup_created", "isolated planner created goal contract");
@@ -659,10 +685,10 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				if (action === "refine") {
 					const refinement = await ctx.ui.editor("Refine goal contract", "Describe what the contract should change. Do not paste secrets.");
 					if (!refinement?.trim()) continue;
-					showPlanningUi(ctx, "refining");
-					ctx.ui.setWorkingMessage("Refining goal contract…");
 					try {
-						draft = await runWithRetries(() => isolated.plan(ctx, outcome, [...toolInfo.values()], refinement), 2);
+						const replacementDraft = await designGoalContract(ctx, outcome, refinement);
+						if (!replacementDraft) { ctx.ui.notify("Goal refinement cancelled; the existing contract is unchanged.", "info"); continue; }
+						draft = replacementDraft;
 						const replacement = createGoalState(draft, ctx);
 						replacement.goalId = state.goalId; replacement.createdAt = state.createdAt; replacement.generation = state.generation + 1;
 						state = replacement; store.set(state); persist(ctx, "setup_refined", "user refined setup contract");

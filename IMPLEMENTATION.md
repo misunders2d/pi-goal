@@ -3,7 +3,7 @@
 This package ships only when the complete product contract is satisfied.
 
 - [x] Durable typed state, atomic mirror, compaction/reload recovery
-- [x] Isolated read-only setup planner and one approval card
+- [x] Isolated tool-free setup planner with clarification-before-contract and one approval card
 - [x] Natural-language steering and one active goal per session
 - [x] Compact widget and responsive detail overlay
 - [x] Typed authority envelope and fail-closed generic safety
