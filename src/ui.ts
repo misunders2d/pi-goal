@@ -55,6 +55,8 @@ export function setupContent(state: GoalState, width: number): string[] {
 		`Safe work beneath ${state.cwd}: read, write, and local build/test processes.`,
 		...(state.authorities.length ? state.authorities.map((authority) => `${authority.label} — ${authority.toolName}, ${authority.maxUses} use${authority.maxUses === 1 ? "" : "s"}`) : ["No external or high-risk actions pre-approved."]),
 	], width);
+	if (state.constraints.length) section(lines, "Constraints", state.constraints, width);
+	if (state.nonGoals.length) section(lines, "Non-goals", state.nonGoals, width);
 	section(lines, "Stop conditions", [
 		"CREDENTIAL — login or access is genuinely required.",
 		"DECISION — a material outcome choice cannot be inferred safely.",
@@ -191,25 +193,6 @@ export function widgetLines(ctx: ExtensionContext, state: GoalState): string[] {
 		`${ctx.ui.theme.fg("accent", state.phase)} ${summary.done}/${summary.total}  ${ctx.ui.theme.fg("dim", `Now: ${truncateToWidth(state.currentAction, 80)}`)}`,
 		ctx.ui.theme.fg("dim", `Next: ${truncateToWidth(state.nextAction, 90)}${state.interrupt ? `  • ${state.interrupt.class}` : ""}`),
 	];
-}
-
-export function showPlanningUi(ctx: ExtensionContext, stage: "designing" | "refining" = "designing"): void {
-	if (!ctx.hasUI || ctx.mode !== "tui") return;
-	const label = stage === "refining" ? "Refining goal contract…" : "Checking clarity and designing goal contract…";
-	ctx.ui.setStatus("pi-goal", ctx.ui.theme.fg("accent", `🎯 ${stage} • setup`));
-	ctx.ui.setWidget("pi-goal", [
-		ctx.ui.theme.fg("accent", `🎯 ${label}`),
-		ctx.ui.theme.fg("dim", "If anything material is unclear, goal mode will ask before creating the contract."),
-	], { placement: "aboveEditor" });
-}
-
-export function showClarificationUi(ctx: ExtensionContext, questions: string[]): void {
-	if (!ctx.hasUI || ctx.mode !== "tui") return;
-	ctx.ui.setStatus("pi-goal", ctx.ui.theme.fg("warning", "🎯 clarification • setup"));
-	ctx.ui.setWidget("pi-goal", [
-		ctx.ui.theme.fg("warning", "🎯 Goal clarification needed"),
-		...questions.map((question, index) => ctx.ui.theme.fg("dim", `${index + 1}. ${truncateToWidth(question, 110)}`)),
-	], { placement: "aboveEditor" });
 }
 
 export function setupTranscriptText(transcript: GoalSetupTranscript): string {

@@ -167,6 +167,48 @@ function normalizeAuthority(authority: Omit<ActionAuthority, "uses">, index: num
 	};
 }
 
+export function createGoalSetupState(outcome: string, ctx: ExtensionContext): GoalState {
+	const at = now();
+	const cleaned = redactText(outcome, Number.MAX_SAFE_INTEGER).text;
+	return {
+		schemaVersion: GOAL_SCHEMA_VERSION,
+		goalId: makeId("goal"),
+		sessionId: ctx.sessionManager.getSessionId(),
+		cwd: ctx.cwd,
+		status: "setting_up",
+		phase: "setup",
+		generation: 1,
+		revision: 0,
+		createdAt: at,
+		updatedAt: at,
+		outcome: { original: cleaned, current: cleaned, amendments: [] },
+		criteria: [],
+		plan: [],
+		verificationChecks: [],
+		authorities: [],
+		constraints: [],
+		nonGoals: [],
+		evidence: [],
+		observations: [],
+		evaluatorReports: [],
+		auditReports: [],
+		currentAction: "Clarifying goal in this conversation",
+		nextAction: "Ask only necessary questions, then submit a complete contract",
+		completionCandidate: false,
+		continuationSequence: 0,
+		turnCount: 0,
+		recoveryCount: 0,
+		auditFailureCount: 0,
+		verificationFailureCount: 0,
+		noProgressCount: 0,
+		repeatedToolCalls: {},
+		repeatedBlockers: {},
+		activeToolCalls: {},
+		backgroundWork: {},
+		setupAwaitingUser: false,
+	};
+}
+
 export function createGoalState(draft: GoalDraft, ctx: ExtensionContext, originalOutcome: string = draft.outcome): GoalState {
 	const at = now();
 	const criteria = draft.criteria.map((text, index) => ({
@@ -209,6 +251,8 @@ export function createGoalState(draft: GoalDraft, ctx: ExtensionContext, origina
 		plan: nodes,
 		verificationChecks: draft.verificationChecks.map(normalizeCheck),
 		authorities: draft.authorities.map(normalizeAuthority),
+		constraints: draft.constraints.map((item) => redactText(item, 500).text),
+		nonGoals: draft.nonGoals.map((item) => redactText(item, 500).text),
 		evidence: [],
 		observations: [],
 		evaluatorReports: [],
@@ -245,6 +289,8 @@ export function normalizeState(raw: unknown): GoalState | undefined {
 	value.revision = Number.isInteger(value.revision) ? value.revision : 0;
 	value.verificationChecks = Array.isArray(value.verificationChecks) ? value.verificationChecks : [];
 	value.authorities = Array.isArray(value.authorities) ? value.authorities : [];
+	value.constraints = Array.isArray(value.constraints) ? value.constraints : [];
+	value.nonGoals = Array.isArray(value.nonGoals) ? value.nonGoals : [];
 	value.evidence = Array.isArray(value.evidence) ? value.evidence : [];
 	value.observations = Array.isArray(value.observations) ? value.observations : [];
 	value.evaluatorReports = Array.isArray(value.evaluatorReports) ? value.evaluatorReports : [];
@@ -260,6 +306,7 @@ export function normalizeState(raw: unknown): GoalState | undefined {
 	value.verificationFailureCount = value.verificationFailureCount ?? 0;
 	value.noProgressCount = value.noProgressCount ?? 0;
 	value.completionCandidate = !!value.completionCandidate;
+	value.setupAwaitingUser = !!value.setupAwaitingUser;
 	return value as GoalState;
 }
 

@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { IsolatedModelRunner, SETUP_PLANNER_SYSTEM_PROMPT, normalizeAuditDecision, normalizeDraft, normalizePlanningResult, withDeadline } from "../src/evaluator.ts";
+import { IsolatedModelRunner, normalizeAuditDecision, normalizeDraft, withDeadline } from "../src/evaluator.ts";
 import piGoalExtension, { isExplicitGoalSteeringInput, isInformationalGoalInput, validateAuditCompletion, verificationRecoveryWindow } from "../src/index.ts";
 import { SETUP_TRANSCRIPT_CUSTOM_TYPE, STATE_CUSTOM_TYPE, createGoalState, sha256 } from "../src/state.ts";
 import type { GoalDraft } from "../src/types.ts";
@@ -100,211 +100,135 @@ test("registers only canonical /goal and rejects noninteractive starts", async (
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("goal setup immediately shows persistent planning feedback", async () => {
+test("goal setup immediately enters durable same-conversation mode", async () => {
 	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
 	try {
 		const harness = makeHarness(root);
-		const pending = harness.command("goal", "Check system health");
-		assert.match(JSON.stringify(harness.statuses), /designing/);
-		assert.match(JSON.stringify(harness.widgets), /Checking clarity and designing goal contract/);
-		assert.match(JSON.stringify(harness.widgets), /ask before creating the contract/);
-		await pending;
-		assert.match(harness.notifications.at(-1).message, /requires an active model/);
-		assert.equal(harness.widgets.at(-1).value, undefined);
+		await harness.command("goal", "Check system health using what we discussed");
+		const state = latestState(harness);
+		assert.equal(state.status, "setting_up");
+		assert.equal(state.outcome.original, "Check system health using what we discussed");
+		assert.match(JSON.stringify(harness.statuses), /setting_up/);
+		assert.equal(harness.messages.length, 1);
+		assert.equal(harness.messages[0].message.customType, "pi-goal-setup-continuation-v1");
+		assert.equal(harness.messages[0].options.triggerTurn, true);
+		const context = (await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "x" })).find(Boolean);
+		assert.match(JSON.stringify(context), /GOAL SETUP ACTIVE IN THIS SAME CONVERSATION/);
+		assert.match(JSON.stringify(context), /Resolve references from prior discussion/);
+		assert.match(JSON.stringify(context), /no operational tools may run yet|pi_goal_submit_contract/);
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("planner requests clarification without workspace tools", async () => {
-	const runner = new IsolatedModelRunner("/tmp/pi-goal-test-agent");
-	let options: any;
-	(runner as any).run = async (value: unknown) => {
-		options = value;
-		return JSON.stringify({ status: "needs_clarification", questions: ["Which goal-mode lifecycle should be tested?"] });
-	};
-	const result = await runner.plan({ cwd: "/tmp/workspace", sessionManager: { buildContextEntries: () => [] } } as any, "testing the goal mode", []);
-	assert.deepEqual(result, { kind: "clarification", questions: ["Which goal-mode lifecycle should be tested?"] });
-	assert.deepEqual(options.tools, []);
-	assert.match(options.systemPrompt, /Never infer unclear intent by inspecting the workspace/);
-});
-
-test("planner clarifies explicitly contradictory requirements without tools", async () => {
-	const runner = new IsolatedModelRunner("/tmp/pi-goal-test-agent");
-	const input = "Create conflict.txt; the final file must both exist with READY content and not exist.";
-	let options: any;
-	(runner as any).run = async (value: any) => {
-		options = value;
-		assert.equal(JSON.parse(value.prompt).userOutcome, input);
-		return JSON.stringify({ status: "needs_clarification", questions: ["Should conflict.txt exist with READY content, or should its final state be absent?"] });
-	};
-	const result = await runner.plan({ cwd: "/tmp/workspace", sessionManager: { buildContextEntries: () => [] } } as any, input, [{ name: "read", description: "Read file", parameters: {} } as any]);
-	assert.deepEqual(result, { kind: "clarification", questions: ["Should conflict.txt exist with READY content, or should its final state be absent?"] });
-	assert.deepEqual(options.tools, []);
-	assert.match(options.systemPrompt, /If multiple materially different contracts are plausible/);
-});
-
-test("planner preserves long authoritative setup text without silent truncation", async () => {
-	const runner = new IsolatedModelRunner("/tmp/pi-goal-test-agent");
-	const outcome = `Build the complete target.\n${"Detailed requirement with exact semantics. ".repeat(180)}`;
-	const answer = `Clarification answer:\n${"Preserve this answered detail. ".repeat(100)}`;
-	let payload: any;
-	(runner as any).run = async (value: any) => {
-		payload = JSON.parse(value.prompt);
-		return JSON.stringify({ status: "needs_clarification", questions: ["One final question?"] });
-	};
-	await runner.plan({ cwd: "/tmp/workspace", model: { contextWindow: 128_000 }, sessionManager: { buildContextEntries: () => [] } } as any, outcome, [], undefined, [{ questions: ["Prior question"], answer }]);
-	assert.ok(outcome.length > 4_000);
-	assert.ok(answer.length > 2_000);
-	assert.equal(payload.userOutcome, outcome);
-	assert.equal(payload.clarifications[0].answer, answer);
-	assert.equal(payload.userOutcome.endsWith("…"), false);
-});
-
-test("planner receives bounded sanitized prior discussion without tool or extension cargo", async () => {
-	const runner = new IsolatedModelRunner("/tmp/pi-goal-test-agent");
-	const outcome = "do that";
-	const entries: any[] = [
-		{ type: "compaction", summary: "Earlier decision: keep the public API stable." },
-		{ type: "branch_summary", summary: "Branch decision: use the TypeScript implementation." },
-		{ type: "message", message: { role: "user", content: "Target package is pi-goal and success means no repeated questions." } },
-		{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "We agreed to preserve setup isolation." }, { type: "toolCall", id: "t1", name: "bash", arguments: { sentinel: "TOOL_CALL_SECRET" } }] } },
-		{ type: "message", message: { role: "toolResult", content: [{ type: "text", text: "TOOL_RESULT_SECRET" }] } },
-		{ type: "custom_message", customType: "hidden", content: "CUSTOM_MESSAGE_SECRET" },
-		{ type: "custom", customType: "state", data: { sentinel: "CUSTOM_STATE_SECRET" } },
-		{ type: "message", message: { role: "user", content: "/goal do that" } },
-	];
-	let payload: any;
-	(runner as any).run = async (value: any) => {
-		payload = JSON.parse(value.prompt);
-		return JSON.stringify({ status: "needs_clarification", questions: ["Confirm?"] });
-	};
-	await runner.plan({ cwd: "/tmp/workspace", model: { contextWindow: 128_000 }, sessionManager: { buildContextEntries: () => entries } } as any, outcome, []);
-	const discussion = JSON.stringify(payload.priorDiscussion);
-	assert.match(discussion, /public API stable/);
-	assert.match(discussion, /TypeScript implementation/);
-	assert.match(discussion, /Target package is pi-goal/);
-	assert.match(discussion, /preserve setup isolation/);
-	assert.doesNotMatch(discussion, /TOOL_CALL_SECRET|TOOL_RESULT_SECRET|CUSTOM_MESSAGE_SECRET|CUSTOM_STATE_SECRET|\/goal do that/);
-	assert.match(payload.priorDiscussion.note, /untrusted cargo/);
-});
-
-test("planner rejects oversized authoritative text explicitly before model execution", async () => {
-	const runner = new IsolatedModelRunner("/tmp/pi-goal-test-agent");
-	let called = false;
-	(runner as any).run = async () => { called = true; return "{}"; };
-	await assert.rejects(
-		() => runner.plan({ cwd: "/tmp/workspace", model: { contextWindow: 4_000 }, sessionManager: { buildContextEntries: () => [] } } as any, "x".repeat(10_000), []),
-		/no user text was truncated/,
-	);
-	assert.equal(called, false);
-});
-
-test("planning result is fail-closed and accepts only clarification or a complete ready contract", () => {
-	assert.deepEqual(
-		normalizePlanningResult({ status: "needs_clarification", questions: ["Target?", "Scope?", "Success condition?", "Extra?"] }, "Do work"),
-		{ kind: "clarification", questions: ["Target?", "Scope?", "Success condition?"] },
-	);
-	assert.throws(() => normalizePlanningResult({ status: "needs_clarification", questions: [] }, "Do work"), /without a question/);
-	assert.throws(() => normalizePlanningResult({ status: "ready" }, "Do work"), /no goal draft/);
-	assert.throws(() => normalizePlanningResult({ outcome: "guessed" }, "Do work"), /invalid planning status/);
-	const ready = normalizePlanningResult({
-		status: "ready",
-		contract: {
-			outcome: "Create READY.md",
-			criteria: ["READY.md exists"],
-			phases: [{ id: "P1", title: "Create file", criterionIds: ["AC1"] }],
-			verificationChecks: [{ id: "V1", kind: "file_exists", label: "READY.md exists", path: "READY.md" }],
-			authorities: [], constraints: [], nonGoals: [],
-		},
-	}, "Create READY.md");
-	assert.equal(ready.kind, "draft");
-});
-
-test("ambiguous goal setup asks before creating or persisting a contract", async () => {
+test("same-conversation clarification stays visible and blocks pre-approval work", async () => {
 	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
-	const originalPlan = IsolatedModelRunner.prototype.plan;
 	try {
 		const harness = makeHarness(root);
-		let calls = 0;
-		IsolatedModelRunner.prototype.plan = async (_ctx, _outcome, _tools, _refinement, clarifications = []) => {
-			calls += 1;
-			assert.equal(harness.branch.length, 0, "setup state must not persist before clarification completes");
-			if (!clarifications.length) return { kind: "clarification", questions: ["Which goal-mode lifecycle should be tested?"] };
-			assert.equal(clarifications[0]?.answer, "Full end-to-end lifecycle");
-			return { kind: "draft", draft };
-		};
-		harness.ctx.ui.editor = async (_title: string, prefilled: string) => `${prefilled}Full end-to-end lifecycle`;
-		harness.ctx.ui.custom = async () => "cancel";
 		await harness.command("goal", "testing the goal mode");
-		assert.equal(calls, 2);
-		assert.match(JSON.stringify(harness.widgets), /Goal clarification needed/);
-		assert.equal(latestState(harness).status, "cancelled");
-	} finally {
-		IsolatedModelRunner.prototype.plan = originalPlan;
-		rmSync(root, { recursive: true, force: true });
-	}
+		const before = latestState(harness);
+		const inputResults = await harness.emit("input", { type: "input", source: "user", text: "Use the full end-to-end lifecycle we discussed" });
+		assert.equal(inputResults.find(Boolean), undefined);
+		assert.equal(latestState(harness).status, "setting_up");
+		assert.equal(latestState(harness).revision, before.revision + 1);
+		const blocked = (await harness.emit("tool_call", { type: "tool_call", toolName: "read", toolCallId: "r1", input: { path: "package.json" } })).find(Boolean);
+		assert.equal(blocked.block, true);
+		assert.match(blocked.reason, /conversational and not approved/);
+		const allowed = (await harness.emit("tool_call", { type: "tool_call", toolName: "pi_goal_submit_contract", toolCallId: "s1", input: {} })).find(Boolean);
+		assert.equal(allowed, undefined);
+	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("goal setup evaluates the third clarification answer before enforcing the cap", async () => {
+test("validated contract gets one approval then runs with declared authority", async () => {
 	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
-	const originalPlan = IsolatedModelRunner.prototype.plan;
 	try {
 		const harness = makeHarness(root);
-		let plannerCalls = 0;
-		IsolatedModelRunner.prototype.plan = async (_ctx, _outcome, _tools, _refinement, clarifications = []) => {
-			plannerCalls += 1;
-			assert.equal(clarifications.length, plannerCalls - 1);
-			if (clarifications.length < 3) return { kind: "clarification", questions: [`Question for round ${clarifications.length + 1}?`] };
-			assert.equal(clarifications[2]?.answer, "Answer 3");
-			return { kind: "draft", draft };
-		};
-		harness.ctx.ui.editor = async (_title: string, prefilled: string) => `${prefilled}Answer ${plannerCalls}`;
-		harness.ctx.ui.custom = async () => "cancel";
 		await harness.command("goal", "testing the goal mode");
-		assert.equal(plannerCalls, 4);
-		assert.equal(latestState(harness).outcome.current, draft.outcome);
-		assert.equal(latestState(harness).status, "cancelled");
-	} finally {
-		IsolatedModelRunner.prototype.plan = originalPlan;
-		rmSync(root, { recursive: true, force: true });
-	}
-});
-
-test("failed clarification setup persists a copyable sanitized transcript and bare goal reopens it", async () => {
-	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
-	const originalPlan = IsolatedModelRunner.prototype.plan;
-	try {
-		const harness = makeHarness(root);
-		let plannerCalls = 0;
-		let transcriptOpens = 0;
-		let lastTranscriptText = "";
-		IsolatedModelRunner.prototype.plan = async () => {
-			plannerCalls += 1;
-			return { kind: "clarification", questions: [`Question for round ${plannerCalls}?`] };
+		const setup = latestState(harness);
+		const contract = {
+			...draft,
+			authorities: [{ id: "A1", label: "Create required external records", actionClass: "external_write", toolName: "functions.records_create", targets: [], maxUses: 5 }],
+			constraints: ["Stay inside the approved workspace"],
+			nonGoals: ["Do not redesign unrelated packages"],
 		};
-		harness.ctx.ui.editor = async (title: string, prefilled: string) => {
-			if (title.startsWith("Goal setup transcript")) { transcriptOpens += 1; lastTranscriptText = prefilled; return undefined; }
-			return `${prefilled}Answer ${plannerCalls} with ghp_abcdefghijklmnopqrstuvwxyz1234`;
-		};
-		await harness.command("goal", "Diagnose setup without losing the final sentinel FINAL-SETUP-SENTINEL");
-		assert.equal(plannerCalls, 4);
-		assert.equal(harness.branch.some((entry) => entry.customType === STATE_CUSTOM_TYPE), false);
-		const transcriptEntries = harness.branch.filter((entry) => entry.customType === SETUP_TRANSCRIPT_CUSTOM_TYPE);
-		assert.equal(transcriptEntries.length, 1);
-		const transcript = transcriptEntries[0].data;
-		assert.equal(transcript.status, "failed");
-		assert.equal(transcript.exchanges.length, 3);
-		assert.match(transcript.outcome, /FINAL-SETUP-SENTINEL/);
-		assert.doesNotMatch(JSON.stringify(transcript), /ghp_abcdefghijklmnopqrstuvwxyz1234/);
-		assert.match(JSON.stringify(transcript), /\[REDACTED\]/);
-		assert.equal(transcriptOpens, 1);
-		assert.match(lastTranscriptText, /Clarification round 3/);
+		await harness.tool("pi_goal_submit_contract", { goalId: setup.goalId, generation: setup.generation, ...contract });
+		assert.equal(latestState(harness).status, "awaiting_approval");
+		assert.deepEqual(latestState(harness).constraints, ["Stay inside the approved workspace"]);
+		assert.deepEqual(latestState(harness).nonGoals, ["Do not redesign unrelated packages"]);
+		const blocked = (await harness.emit("tool_call", { type: "tool_call", toolName: "records_create", toolCallId: "pre", input: { name: "x" } })).find(Boolean);
+		assert.equal(blocked.block, true);
+		harness.ctx.ui.custom = async () => "approve";
 		await harness.command("goal", "");
-		assert.equal(transcriptOpens, 2);
-		assert.match(lastTranscriptText, /Question for round 1/);
-	} finally {
-		IsolatedModelRunner.prototype.plan = originalPlan;
-		rmSync(root, { recursive: true, force: true });
-	}
+		const running = latestState(harness);
+		assert.equal(running.status, "running");
+		assert.equal(running.authorities[0].maxUses, 5);
+		assert.equal(running.authorities[0].toolName, "records_create");
+		const allowed = (await harness.emit("tool_call", { type: "tool_call", toolName: "records_create", toolCallId: "post", input: { name: "x" } })).find(Boolean);
+		assert.equal(allowed, undefined);
+		assert.equal(latestState(harness).authorities[0].uses, 1);
+		assert.match(JSON.stringify(harness.messages), /do not seek routine per-tool approval/);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("contract refinement returns to the same conversation without an isolated planner", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root);
+		await harness.command("goal", "testing the goal mode");
+		const setup = latestState(harness);
+		await harness.tool("pi_goal_submit_contract", { goalId: setup.goalId, generation: setup.generation, ...draft });
+		harness.ctx.ui.custom = async () => "refine";
+		await harness.command("goal", "");
+		const refining = latestState(harness);
+		assert.equal(refining.status, "setting_up");
+		assert.equal(refining.criteria[0].text, "State is durable");
+		assert.equal(harness.messages.at(-1).message.customType, "pi-goal-setup-continuation-v1");
+		assert.match(JSON.stringify(harness.messages.at(-1)), /Ask what should change/);
+		const context = (await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "x" })).find(Boolean);
+		assert.match(JSON.stringify(context), /Current proposed contract being refined/);
+		assert.match(JSON.stringify(context), /do not impose an arbitrary question limit/);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("pending setup survives settlement and reload without duplicate prompting", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root);
+		await harness.command("goal", "retest that same scenario");
+		assert.equal(harness.messages.length, 1);
+		await harness.emit("agent_settled", { type: "agent_settled" });
+		assert.equal(latestState(harness).setupAwaitingUser, true);
+		await harness.emit("session_start", { type: "session_start", reason: "reload" });
+		assert.equal(harness.messages.length, 1, "reload must not repeat a question while waiting for user");
+		for (let index = 0; index < 5; index += 1) {
+			await harness.emit("input", { type: "input", source: "user", text: `clarification ${index + 1}` });
+			assert.equal(latestState(harness).status, "setting_up");
+		}
+		assert.equal(latestState(harness).setupAwaitingUser, false);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("invalid contract fails closed while normal transcript remains the setup record", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	try {
+		const harness = makeHarness(root);
+		await harness.command("goal", "Diagnose setup without losing the final sentinel FINAL-SETUP-SENTINEL");
+		const setup = latestState(harness);
+		await assert.rejects(
+			() => harness.tool("pi_goal_submit_contract", { goalId: setup.goalId, generation: setup.generation, outcome: "bad", criteria: ["done"], phases: [{ id: "P1", title: "work" }], verificationChecks: [], authorities: [], constraints: [], nonGoals: [] }),
+			/no mechanical verification checks/,
+		);
+		assert.equal(latestState(harness).status, "setting_up");
+		await assert.rejects(
+			() => harness.tool("pi_goal_submit_contract", { goalId: setup.goalId, generation: setup.generation, ...draft, authorities: [{ id: "A1", label: "Unavailable", actionClass: "external_write", toolName: "functions.not_registered", targets: [], maxUses: 1 }] }),
+			/unavailable operational tool/,
+		);
+		assert.equal(latestState(harness).status, "setting_up");
+		assert.match(latestState(harness).outcome.original, /FINAL-SETUP-SENTINEL/);
+		assert.equal(harness.branch.some((entry) => entry.customType === SETUP_TRANSCRIPT_CUSTOM_TYPE), false);
+		const handled = (await harness.emit("input", { type: "input", source: "user", text: "cancel goal setup" })).find(Boolean);
+		assert.equal(handled.action, "handled");
+		assert.equal(latestState(harness).status, "cancelled");
+		assert.equal(harness.aborts, 1);
+	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("restores running state, injects it every turn, and blocks out-of-workspace mutation", async () => {
@@ -675,8 +599,7 @@ test("explicit unknown evidence IDs fail before state mutation", async () => {
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("planner rejects circular audit-process criteria before approval", () => {
-	assert.match(SETUP_PLANNER_SYSTEM_PROMPT, /Never add criteria about submitting completion/);
+test("contract validation rejects circular audit-process criteria before approval", () => {
 	assert.throws(() => normalizeDraft({ ...draft, criteria: ["The goal is complete when the isolated auditor reports pass"] }, draft.outcome), /process-only audit criteria/);
 	assert.throws(() => normalizeDraft({
 		outcome: "Create READY.md",
@@ -695,15 +618,13 @@ test("planner rejects circular audit-process criteria before approval", () => {
 	assert.deepEqual(substantive.criteria, ["READY.md exists"]);
 });
 
-test("planner rejects development-only checks against installed packages", () => {
+test("contract validation rejects development-only checks against installed packages", () => {
 	const base = {
 		outcome: "Validate installed goal package",
 		criteria: ["Installed package is healthy"],
 		phases: [{ id: "P1", title: "Validate", criterionIds: ["AC1"] }],
 		authorities: [], constraints: [], nonGoals: [],
 	};
-	assert.match(SETUP_PLANNER_SYSTEM_PROMPT, /installed packages beneath node_modules/);
-	assert.match(SETUP_PLANNER_SYSTEM_PROMPT, /never generate multiline python\/node scripts/);
 	assert.throws(() => normalizeDraft({
 		...base,
 		verificationChecks: [{ id: "V0", kind: "command_exit", label: "multiline python", executable: "python3", args: ["-c", "print('one')\nprint('two')"] }],

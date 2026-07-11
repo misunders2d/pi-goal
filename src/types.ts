@@ -1,6 +1,7 @@
 export const GOAL_SCHEMA_VERSION = 1 as const;
 
 export type GoalStatus =
+	| "setting_up"
 	| "awaiting_approval"
 	| "running"
 	| "paused"
@@ -207,6 +208,8 @@ export interface GoalState {
 	plan: GoalNode[];
 	verificationChecks: VerificationCheck[];
 	authorities: ActionAuthority[];
+	constraints: string[];
+	nonGoals: string[];
 	evidence: EvidenceRecord[];
 	observations: ToolObservation[];
 	evaluatorReports: EvaluatorReport[];
@@ -231,6 +234,7 @@ export interface GoalState {
 	repeatedBlockers: Record<string, number>;
 	activeToolCalls: Record<string, { toolName: string; startedAt: string }>;
 	backgroundWork: Record<string, BackgroundWork>;
+	setupAwaitingUser?: boolean;
 }
 
 export interface GoalDraft {
@@ -247,11 +251,6 @@ export interface GoalDraft {
 	authorities: Omit<ActionAuthority, "uses">[];
 	constraints: string[];
 	nonGoals: string[];
-}
-
-export interface GoalClarificationExchange {
-	questions: string[];
-	answer: string;
 }
 
 export interface GoalSetupTranscriptExchange {
@@ -276,10 +275,6 @@ export interface GoalSetupTranscript {
 	createdAt: string;
 	updatedAt: string;
 }
-
-export type GoalPlanningResult =
-	| { kind: "clarification"; questions: string[] }
-	| { kind: "draft"; draft: GoalDraft };
 
 export interface GoalEventRecord {
 	schemaVersion: typeof GOAL_SCHEMA_VERSION;
