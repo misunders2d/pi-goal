@@ -244,6 +244,31 @@ test("ambiguous goal setup asks before creating or persisting a contract", async
 	}
 });
 
+test("goal setup evaluates the third clarification answer before enforcing the cap", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	const originalPlan = IsolatedModelRunner.prototype.plan;
+	try {
+		const harness = makeHarness(root);
+		let plannerCalls = 0;
+		IsolatedModelRunner.prototype.plan = async (_ctx, _outcome, _tools, _refinement, clarifications = []) => {
+			plannerCalls += 1;
+			assert.equal(clarifications.length, plannerCalls - 1);
+			if (clarifications.length < 3) return { kind: "clarification", questions: [`Question for round ${clarifications.length + 1}?`] };
+			assert.equal(clarifications[2]?.answer, "Answer 3");
+			return { kind: "draft", draft };
+		};
+		harness.ctx.ui.editor = async (_title: string, prefilled: string) => `${prefilled}Answer ${plannerCalls}`;
+		harness.ctx.ui.custom = async () => "cancel";
+		await harness.command("goal", "testing the goal mode");
+		assert.equal(plannerCalls, 4);
+		assert.equal(latestState(harness).outcome.current, draft.outcome);
+		assert.equal(latestState(harness).status, "cancelled");
+	} finally {
+		IsolatedModelRunner.prototype.plan = originalPlan;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("failed clarification setup persists a copyable sanitized transcript and bare goal reopens it", async () => {
 	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
 	const originalPlan = IsolatedModelRunner.prototype.plan;
@@ -261,7 +286,7 @@ test("failed clarification setup persists a copyable sanitized transcript and ba
 			return `${prefilled}Answer ${plannerCalls} with ghp_abcdefghijklmnopqrstuvwxyz1234`;
 		};
 		await harness.command("goal", "Diagnose setup without losing the final sentinel FINAL-SETUP-SENTINEL");
-		assert.equal(plannerCalls, 3);
+		assert.equal(plannerCalls, 4);
 		assert.equal(harness.branch.some((entry) => entry.customType === STATE_CUSTOM_TYPE), false);
 		const transcriptEntries = harness.branch.filter((entry) => entry.customType === SETUP_TRANSCRIPT_CUSTOM_TYPE);
 		assert.equal(transcriptEntries.length, 1);

@@ -565,7 +565,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 
 	async function designGoalContract(ctx: ExtensionCommandContext, outcome: string, transcript: GoalSetupTranscript, refinement?: string): Promise<GoalDraft | undefined> {
 		const clarifications: GoalClarificationExchange[] = [];
-		for (let round = 0; round < 3; round += 1) {
+		for (let round = 0; round <= 3; round += 1) {
 			showPlanningUi(ctx, refinement ? "refining" : "designing");
 			ctx.ui.setWorkingMessage(round ? "Applying goal clarification…" : refinement ? "Refining goal contract…" : "Checking clarity and designing goal contract…");
 			const result = await runWithRetries(
@@ -574,6 +574,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			);
 			ctx.ui.setWorkingMessage();
 			if (result.kind === "draft") { transcript.status = "ready"; transcript.updatedAt = now(); return result.draft; }
+			if (round === 3) break;
 
 			const questions = result.questions.map((question) => sanitizeSetupText(transcript, question));
 			const exchange = { round: round + 1, questions, at: now() } as GoalSetupTranscript["exchanges"][number];
