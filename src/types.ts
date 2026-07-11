@@ -254,6 +254,29 @@ export interface GoalClarificationExchange {
 	answer: string;
 }
 
+export interface GoalSetupTranscriptExchange {
+	round: number;
+	questions: string[];
+	answer?: string;
+	cancelled?: boolean;
+	at: string;
+}
+
+export interface GoalSetupTranscript {
+	schemaVersion: typeof GOAL_SCHEMA_VERSION;
+	transcriptId: string;
+	sessionId: string;
+	cwd: string;
+	status: "planning" | "ready" | "failed" | "cancelled";
+	outcome: string;
+	refinements: string[];
+	exchanges: GoalSetupTranscriptExchange[];
+	reason?: string;
+	redacted: boolean;
+	createdAt: string;
+	updatedAt: string;
+}
+
 export type GoalPlanningResult =
 	| { kind: "clarification"; questions: string[] }
 	| { kind: "draft"; draft: GoalDraft };

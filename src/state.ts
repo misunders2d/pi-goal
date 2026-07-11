@@ -14,6 +14,7 @@ import {
 
 export const STATE_CUSTOM_TYPE = "pi-goal-state-v1";
 export const CONTEXT_CUSTOM_TYPE = "pi-goal-context-v1";
+export const SETUP_TRANSCRIPT_CUSTOM_TYPE = "pi-goal-setup-transcript-v1";
 
 export function now(): string {
 	return new Date().toISOString();

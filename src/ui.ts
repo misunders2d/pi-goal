@@ -2,7 +2,7 @@ import type { ExtensionCommandContext, ExtensionContext, Theme } from "@earendil
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { progress } from "./state.ts";
-import type { GoalState } from "./types.ts";
+import type { GoalSetupTranscript, GoalState } from "./types.ts";
 
 export type SetupAction = "approve" | "refine" | "cancel";
 export type DetailAction = "close" | "pause" | "resume" | "cancel" | "approve_risk" | "resolve";
@@ -210,6 +210,33 @@ export function showClarificationUi(ctx: ExtensionContext, questions: string[]):
 		ctx.ui.theme.fg("warning", "🎯 Goal clarification needed"),
 		...questions.map((question, index) => ctx.ui.theme.fg("dim", `${index + 1}. ${truncateToWidth(question, 110)}`)),
 	], { placement: "aboveEditor" });
+}
+
+export function setupTranscriptText(transcript: GoalSetupTranscript): string {
+	const lines = [
+		"pi-goal setup transcript",
+		`Status: ${transcript.status}`,
+		`Reason: ${transcript.reason ?? "none"}`,
+		`Created: ${transcript.createdAt}`,
+		`Updated: ${transcript.updatedAt}`,
+		`Redacted: ${transcript.redacted ? "yes" : "no"}`,
+		"",
+		"/goal outcome:",
+		transcript.outcome,
+	];
+	for (const exchange of transcript.exchanges) {
+		lines.push("", `Clarification round ${exchange.round}`);
+		exchange.questions.forEach((question, index) => lines.push(`Q${index + 1}: ${question}`));
+		lines.push("Answer:", exchange.answer ?? (exchange.cancelled ? "[cancelled before answer]" : "[no answer recorded]"));
+	}
+	if (transcript.refinements.length) {
+		lines.push("", "Refinements:", ...transcript.refinements.map((value, index) => `${index + 1}. ${value}`));
+	}
+	return `${lines.join("\n")}\n`;
+}
+
+export async function showSetupTranscriptEditor(ctx: ExtensionCommandContext, transcript: GoalSetupTranscript): Promise<void> {
+	await ctx.ui.editor("Goal setup transcript — copy if needed, then close", setupTranscriptText(transcript));
 }
 
 export function updateGoalUi(ctx: ExtensionContext, state?: GoalState): void {

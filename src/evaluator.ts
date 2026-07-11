@@ -273,7 +273,7 @@ export function normalizePlanningResult(value: unknown, originalOutcome: string,
 			? item.questions
 				.filter((question): question is string => typeof question === "string" && !!question.trim())
 				.slice(0, 3)
-				.map((question) => redactText(question.trim(), 300).text)
+				.map((question) => redactText(question.trim(), Number.MAX_SAFE_INTEGER).text)
 			: [];
 		if (!questions.length) throw new Error("planner requested clarification without a question");
 		return { kind: "clarification", questions };

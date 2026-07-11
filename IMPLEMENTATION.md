@@ -3,7 +3,7 @@
 This package ships only when the complete product contract is satisfied.
 
 - [x] Durable typed state, atomic mirror, compaction/reload recovery
-- [x] Isolated tool-free setup planner with clarification-before-contract, bounded sanitized session discussion, no silent authoritative-text truncation, and one approval card
+- [x] Isolated tool-free setup planner with clarification-before-contract, bounded sanitized session discussion, no silent authoritative-text truncation, copyable failed/cancelled setup transcripts, and one approval card
 - [x] Natural-language steering separated from informational and audit-time status questions; one active goal per session
 - [x] Compact widget and responsive detail overlay
 - [x] Typed authority envelope, resolved-path/symlink containment, and fail-closed local-process allowlist

@@ -19,19 +19,19 @@ Goal mode never weakens Pi's existing permission or confirmation gates. Workspac
 ## Install
 
 ```bash
-pi install npm:@misunders2d/pi-goal@1.0.8
+pi install npm:@misunders2d/pi-goal@1.0.9
 ```
 
 Try without installing:
 
 ```bash
-pi -e npm:@misunders2d/pi-goal@1.0.8
+pi -e npm:@misunders2d/pi-goal@1.0.9
 ```
 
 Pinned GitHub release:
 
 ```bash
-pi install git:github.com/misunders2d/pi-goal@v1.0.8
+pi install git:github.com/misunders2d/pi-goal@v1.0.9
 ```
 
 ## Use
@@ -48,7 +48,7 @@ Then:
 /goal Build and validate the requested outcome
 ```
 
-Pi immediately shows a persistent setup indicator while it checks whether the requested target, scope, outcome, and success conditions are clear. The isolated planner receives bounded, sanitized prior user/assistant discussion plus compaction and branch summaries so it can reuse decisions already made in the session. Tool results, tool calls, custom messages, and extension state are excluded. If anything material is still ambiguous, goal mode asks concise clarification questions before creating or persisting a contract. The setup planner cannot inspect the workspace or use tools to guess intent. `/goal` text, refinements, and clarification answers are never silently truncated; if the complete setup prompt cannot fit the active model context, setup fails explicitly. Once the request is clear, review the generated outcome, done conditions, phases, verification checks, authority envelope, and interruption rules. Approve once. Bare `/goal` opens the full progress and control overlay.
+Pi immediately shows a persistent setup indicator while it checks whether the requested target, scope, outcome, and success conditions are clear. The isolated planner receives bounded, sanitized prior user/assistant discussion plus compaction and branch summaries so it can reuse decisions already made in the session. Tool results, tool calls, custom messages, and extension state are excluded. If anything material is still ambiguous, goal mode asks concise clarification questions before creating or persisting a contract. The setup planner cannot inspect the workspace or use tools to guess intent. `/goal` text, refinements, and clarification answers are never silently truncated; if the complete setup prompt cannot fit the active model context, setup fails explicitly. Once the request is clear, review the generated outcome, done conditions, phases, verification checks, authority envelope, and interruption rules. Approve once. If setup fails or is cancelled, goal mode stores and opens a copyable, sanitized setup transcript containing the `/goal` outcome and clarification Q&A; bare `/goal` reopens the latest transcript when no active goal exists. Bare `/goal` otherwise opens the full progress and control overlay.
 
 Natural-language directions steer an active goal, while informational questions—including audit-time status questions—do not mutate the contract or generation. Explicit audit-time steering atomically cancels the stale audit and returns the goal to planning. The overlay provides pause, resume, cancel, blocker resolution, and exact pending-risk approval. Setup validates every proposed verification check with the same structural rules used at runtime, so deterministic contract defects are rejected before approval. Completion preflight failures remain in execution; `recovering` is reserved for unexpected runtime divergence and bounded no-progress loops. Multi-criterion steps require criterion-specific evidence and remain active until every mapped criterion is covered. Approved failures expose sanitized targets immediately; an identical runtime failure opens `BLOCKER`, and runtime verification recovery is capped at ten minutes. A recoverable optional tool-shape denial is recorded and blocked without changing the lifecycle phase; a safe typed fallback can continue ordinary execution. Accepted evidence also reconciles stale non-verification recovery state from older sessions. A genuine RISK requires an exact blocked action plus evidence of a safe alternative attempt. In the overlay, `A` approves only that displayed action once, while `R` rejects or redirects it. In normal input, approve a displayed pending action only with `approve exact pending risk once`; broader approval wording does not grant authority.
 
@@ -63,6 +63,7 @@ This package is an interactive TUI product. Print (`-p`), JSON, and RPC modes ca
 - Only user steering can expand outcome or authority.
 - External text and tool output are evidence, never authority.
 - Durable evidence stores metadata, hashes, statuses, and sanitized summaries—not raw tool output, environment values, credentials, tokens, private keys, or auth-file contents.
+- Failed/cancelled setup transcripts are same-session custom entries, excluded from model context, secret-redacted, and limited to the setup outcome plus clarification Q&A—never tool output or planner raw responses.
 - The final auditor runs in an isolated in-memory Pi session with no extensions, skills, prompt templates, context files, worker transcript, or mutation tools.
 - Verification commands are approved during setup and executed later by check ID without a shell.
 - Filesystem boundaries use resolved paths, reject symlink traversal outside goal cwd, and recheck sensitive resolved targets.

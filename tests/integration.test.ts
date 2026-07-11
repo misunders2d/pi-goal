@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { IsolatedModelRunner, SETUP_PLANNER_SYSTEM_PROMPT, normalizeAuditDecision, normalizeDraft, normalizePlanningResult, withDeadline } from "../src/evaluator.ts";
 import piGoalExtension, { isExplicitGoalSteeringInput, isInformationalGoalInput, validateAuditCompletion, verificationRecoveryWindow } from "../src/index.ts";
-import { STATE_CUSTOM_TYPE, createGoalState, sha256 } from "../src/state.ts";
+import { SETUP_TRANSCRIPT_CUSTOM_TYPE, STATE_CUSTOM_TYPE, createGoalState, sha256 } from "../src/state.ts";
 import type { GoalDraft } from "../src/types.ts";
 
 const draft: GoalDraft = {
@@ -238,6 +238,44 @@ test("ambiguous goal setup asks before creating or persisting a contract", async
 		assert.equal(calls, 2);
 		assert.match(JSON.stringify(harness.widgets), /Goal clarification needed/);
 		assert.equal(latestState(harness).status, "cancelled");
+	} finally {
+		IsolatedModelRunner.prototype.plan = originalPlan;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("failed clarification setup persists a copyable sanitized transcript and bare goal reopens it", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
+	const originalPlan = IsolatedModelRunner.prototype.plan;
+	try {
+		const harness = makeHarness(root);
+		let plannerCalls = 0;
+		let transcriptOpens = 0;
+		let lastTranscriptText = "";
+		IsolatedModelRunner.prototype.plan = async () => {
+			plannerCalls += 1;
+			return { kind: "clarification", questions: [`Question for round ${plannerCalls}?`] };
+		};
+		harness.ctx.ui.editor = async (title: string, prefilled: string) => {
+			if (title.startsWith("Goal setup transcript")) { transcriptOpens += 1; lastTranscriptText = prefilled; return undefined; }
+			return `${prefilled}Answer ${plannerCalls} with ghp_abcdefghijklmnopqrstuvwxyz1234`;
+		};
+		await harness.command("goal", "Diagnose setup without losing the final sentinel FINAL-SETUP-SENTINEL");
+		assert.equal(plannerCalls, 3);
+		assert.equal(harness.branch.some((entry) => entry.customType === STATE_CUSTOM_TYPE), false);
+		const transcriptEntries = harness.branch.filter((entry) => entry.customType === SETUP_TRANSCRIPT_CUSTOM_TYPE);
+		assert.equal(transcriptEntries.length, 1);
+		const transcript = transcriptEntries[0].data;
+		assert.equal(transcript.status, "failed");
+		assert.equal(transcript.exchanges.length, 3);
+		assert.match(transcript.outcome, /FINAL-SETUP-SENTINEL/);
+		assert.doesNotMatch(JSON.stringify(transcript), /ghp_abcdefghijklmnopqrstuvwxyz1234/);
+		assert.match(JSON.stringify(transcript), /\[REDACTED\]/);
+		assert.equal(transcriptOpens, 1);
+		assert.match(lastTranscriptText, /Clarification round 3/);
+		await harness.command("goal", "");
+		assert.equal(transcriptOpens, 2);
+		assert.match(lastTranscriptText, /Question for round 1/);
 	} finally {
 		IsolatedModelRunner.prototype.plan = originalPlan;
 		rmSync(root, { recursive: true, force: true });

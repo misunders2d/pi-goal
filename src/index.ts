@@ -18,6 +18,7 @@ import {
 import {
 	AsyncMutex,
 	CONTEXT_CUSTOM_TYPE,
+	SETUP_TRANSCRIPT_CUSTOM_TYPE,
 	GoalStore,
 	createGoalState,
 	inputHash,
@@ -39,12 +40,13 @@ import type {
 	GoalDraft,
 	GoalInterrupt,
 	GoalNode,
+	GoalSetupTranscript,
 	GoalState,
 	InterruptClass,
 	VerificationCheck,
 	VerificationResult,
 } from "./types.ts";
-import { showClarificationUi, showDetailOverlay, showPlanningUi, showSetupCard, updateGoalUi } from "./ui.ts";
+import { showClarificationUi, showDetailOverlay, showPlanningUi, showSetupCard, showSetupTranscriptEditor, updateGoalUi } from "./ui.ts";
 import { runAllChecks } from "./verification.ts";
 
 const GOAL_TOOL_NAMES = new Set([
@@ -358,6 +360,53 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		return state;
 	}
 
+	function sanitizeSetupText(transcript: GoalSetupTranscript, value: string): string {
+		const cleaned = redactText(value, Number.MAX_SAFE_INTEGER);
+		transcript.redacted ||= cleaned.redacted;
+		return cleaned.text;
+	}
+
+	function createSetupTranscript(ctx: ExtensionContext, outcome: string): GoalSetupTranscript {
+		const at = now();
+		const transcript: GoalSetupTranscript = {
+			schemaVersion: 1,
+			transcriptId: makeId("setup"),
+			sessionId: ctx.sessionManager.getSessionId(),
+			cwd: ctx.cwd,
+			status: "planning",
+			outcome: "",
+			refinements: [],
+			exchanges: [],
+			redacted: false,
+			createdAt: at,
+			updatedAt: at,
+		};
+		transcript.outcome = sanitizeSetupText(transcript, outcome);
+		return transcript;
+	}
+
+	function latestSetupTranscript(ctx: ExtensionContext): GoalSetupTranscript | undefined {
+		for (const entry of [...ctx.sessionManager.getBranch()].reverse()) {
+			if (entry.type !== "custom" || entry.customType !== SETUP_TRANSCRIPT_CUSTOM_TYPE) continue;
+			const value = entry.data as GoalSetupTranscript | undefined;
+			if (value?.schemaVersion === 1 && value.sessionId === ctx.sessionManager.getSessionId() && value.cwd === ctx.cwd) return value;
+		}
+		return undefined;
+	}
+
+	function finalizeSetupTranscript(ctx: ExtensionCommandContext, transcript: GoalSetupTranscript, status: "failed" | "cancelled", reason: string): void {
+		transcript.status = status;
+		transcript.reason = sanitizeSetupText(transcript, reason);
+		transcript.updatedAt = now();
+		try { pi.appendEntry(SETUP_TRANSCRIPT_CUSTOM_TYPE, structuredClone(transcript)); }
+		catch (error) { ctx.ui.notify(`Goal setup transcript could not be saved: ${error instanceof Error ? error.message : String(error)}`, "warning"); }
+	}
+
+	async function showFinalSetupTranscript(ctx: ExtensionCommandContext, transcript: GoalSetupTranscript): Promise<void> {
+		try { await showSetupTranscriptEditor(ctx, structuredClone(transcript)); }
+		catch (error) { ctx.ui.notify(`Goal setup transcript could not be opened: ${error instanceof Error ? error.message : String(error)}`, "warning"); }
+	}
+
 	function triggerContinuation(state: GoalState, reason: string): void {
 		const sequence = state.continuationSequence;
 		const key = `${state.goalId}:${state.generation}:${sequence}`;
@@ -514,7 +563,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		throw last;
 	}
 
-	async function designGoalContract(ctx: ExtensionCommandContext, outcome: string, refinement?: string): Promise<GoalDraft | undefined> {
+	async function designGoalContract(ctx: ExtensionCommandContext, outcome: string, transcript: GoalSetupTranscript, refinement?: string): Promise<GoalDraft | undefined> {
 		const clarifications: GoalClarificationExchange[] = [];
 		for (let round = 0; round < 3; round += 1) {
 			showPlanningUi(ctx, refinement ? "refining" : "designing");
@@ -524,18 +573,24 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				2,
 			);
 			ctx.ui.setWorkingMessage();
-			if (result.kind === "draft") return result.draft;
+			if (result.kind === "draft") { transcript.status = "ready"; transcript.updatedAt = now(); return result.draft; }
 
-			showClarificationUi(ctx, result.questions);
-			const template = `Questions:\n${result.questions.map((question, index) => `${index + 1}. ${question}`).join("\n")}\n\nAnswers:\n`;
+			const questions = result.questions.map((question) => sanitizeSetupText(transcript, question));
+			const exchange = { round: round + 1, questions, at: now() } as GoalSetupTranscript["exchanges"][number];
+			transcript.exchanges.push(exchange);
+			showClarificationUi(ctx, questions);
+			const template = `Questions:\n${questions.map((question, index) => `${index + 1}. ${question}`).join("\n")}\n\nAnswers:\n`;
 			let answer: string | undefined;
 			while (!answer) {
 				const response = await ctx.ui.editor("Clarify goal before contract creation", template);
-				if (response === undefined) return undefined;
+				if (response === undefined) { exchange.cancelled = true; transcript.updatedAt = now(); return undefined; }
 				answer = (response.startsWith(template) ? response.slice(template.length) : response).trim();
 				if (!answer) ctx.ui.notify("Please answer the clarification question(s), or press Escape to cancel goal setup.", "warning");
 			}
-			clarifications.push({ questions: result.questions, answer });
+			answer = sanitizeSetupText(transcript, answer);
+			exchange.answer = answer;
+			transcript.updatedAt = now();
+			clarifications.push({ questions, answer });
 		}
 		throw new Error("goal remains materially unclear after three clarification rounds; restart /goal with a more specific outcome");
 	}
@@ -788,7 +843,16 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			const outcome = args.trim();
 			const existing = load(ctx);
 			if (!outcome) {
-				if (!existing) { ctx.ui.notify("No goal in this session. Start with /goal <outcome>.", "info"); return; }
+				const transcript = latestSetupTranscript(ctx);
+				if (!existing) {
+					if (transcript) await showFinalSetupTranscript(ctx, transcript);
+					else ctx.ui.notify("No goal in this session. Start with /goal <outcome>.", "info");
+					return;
+				}
+				if (existing.status === "cancelled" && transcript && Date.parse(transcript.updatedAt) >= Date.parse(existing.updatedAt)) {
+					await showFinalSetupTranscript(ctx, transcript);
+					return;
+				}
 				await handleDetailAction(ctx, await showDetailOverlay(ctx, structuredClone(existing)));
 				return;
 			}
@@ -797,24 +861,51 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			refreshToolInfo();
+			const setupTranscript = createSetupTranscript(ctx, outcome);
 			let draft: GoalDraft | undefined;
-			try { draft = await designGoalContract(ctx, outcome); }
-			catch (error) { ctx.ui.setWorkingMessage(); updateGoalUi(ctx, undefined); ctx.ui.notify(`Goal setup failed: ${error instanceof Error ? error.message : String(error)}`, "error"); return; }
+			try { draft = await designGoalContract(ctx, outcome, setupTranscript); }
+			catch (error) {
+				ctx.ui.setWorkingMessage(); updateGoalUi(ctx, undefined);
+				const reason = error instanceof Error ? error.message : String(error);
+				finalizeSetupTranscript(ctx, setupTranscript, "failed", reason);
+				ctx.ui.notify(`Goal setup failed: ${reason}`, "error");
+				await showFinalSetupTranscript(ctx, setupTranscript);
+				return;
+			}
 			ctx.ui.setWorkingMessage();
-			if (!draft) { updateGoalUi(ctx, undefined); ctx.ui.notify("Goal setup cancelled before contract creation.", "info"); return; }
-			let state = createGoalState(draft, ctx, outcome);
+			if (!draft) {
+				updateGoalUi(ctx, undefined);
+				finalizeSetupTranscript(ctx, setupTranscript, "cancelled", "Goal setup cancelled before contract creation.");
+				ctx.ui.notify("Goal setup cancelled before contract creation. Bare /goal reopens the transcript.", "info");
+				await showFinalSetupTranscript(ctx, setupTranscript);
+				return;
+			}
+			let state: GoalState;
+			try { state = createGoalState(draft, ctx, outcome); }
+			catch (error) {
+				const reason = error instanceof Error ? error.message : String(error);
+				finalizeSetupTranscript(ctx, setupTranscript, "failed", reason);
+				ctx.ui.notify(`Goal setup failed: ${reason}`, "error");
+				await showFinalSetupTranscript(ctx, setupTranscript);
+				return;
+			}
 			store.set(state);
 			persist(ctx, "setup_created", "isolated planner created goal contract");
 			while (true) {
 				const action = await showSetupCard(ctx, structuredClone(state));
 				if (action === "cancel") {
-					state.status = "cancelled"; state.phase = "done"; store.set(state); persist(ctx, "setup_cancelled", "user cancelled goal setup"); updateGoalUi(ctx, undefined); return;
+					state.status = "cancelled"; state.phase = "done"; store.set(state); persist(ctx, "setup_cancelled", "user cancelled goal setup"); updateGoalUi(ctx, undefined);
+					finalizeSetupTranscript(ctx, setupTranscript, "cancelled", "User cancelled goal setup from the contract review.");
+					await showFinalSetupTranscript(ctx, setupTranscript);
+					return;
 				}
 				if (action === "refine") {
 					const refinement = await ctx.ui.editor("Refine goal contract", "Describe what the contract should change. Do not paste secrets.");
 					if (!refinement?.trim()) continue;
+					const cleanedRefinement = sanitizeSetupText(setupTranscript, refinement.trim());
+					setupTranscript.refinements.push(cleanedRefinement);
 					try {
-						const replacementDraft = await designGoalContract(ctx, outcome, refinement);
+						const replacementDraft = await designGoalContract(ctx, outcome, setupTranscript, cleanedRefinement);
 						if (!replacementDraft) { ctx.ui.notify("Goal refinement cancelled; the existing contract is unchanged.", "info"); continue; }
 						draft = replacementDraft;
 						const replacement = createGoalState(draft, ctx, outcome);
