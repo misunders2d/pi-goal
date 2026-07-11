@@ -166,7 +166,7 @@ function normalizeAuthority(authority: Omit<ActionAuthority, "uses">, index: num
 	};
 }
 
-export function createGoalState(draft: GoalDraft, ctx: ExtensionContext): GoalState {
+export function createGoalState(draft: GoalDraft, ctx: ExtensionContext, originalOutcome: string = draft.outcome): GoalState {
 	const at = now();
 	const criteria = draft.criteria.map((text, index) => ({
 		id: `AC${index + 1}`,
@@ -199,7 +199,11 @@ export function createGoalState(draft: GoalDraft, ctx: ExtensionContext): GoalSt
 		revision: 0,
 		createdAt: at,
 		updatedAt: at,
-		outcome: { original: redactText(draft.outcome, 2_000).text, current: redactText(draft.outcome, 2_000).text, amendments: [] },
+		outcome: {
+			original: redactText(originalOutcome, Number.MAX_SAFE_INTEGER).text,
+			current: redactText(draft.outcome, Number.MAX_SAFE_INTEGER).text,
+			amendments: [],
+		},
 		criteria,
 		plan: nodes,
 		verificationChecks: draft.verificationChecks.map(normalizeCheck),

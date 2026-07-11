@@ -40,6 +40,14 @@ test("creates a deterministic complete state shape", () => {
 	assert.equal(state.criteria.length, 2);
 });
 
+test("preserves the complete authoritative user request separately from planner outcome", () => {
+	const original = `Original request:\n${"Exact requirement. ".repeat(300)}`;
+	const state = createGoalState({ ...draft, outcome: "Planner contract summary" }, fakeContext("/tmp/work"), original);
+	assert.ok(original.length > 2_000);
+	assert.equal(state.outcome.original, original);
+	assert.equal(state.outcome.current, "Planner contract summary");
+});
+
 test("DAG validation rejects missing dependencies, cycles, and multiple active nodes", () => {
 	const at = new Date().toISOString();
 	const node = (id: string, dependsOn: string[], status: any = "pending") => ({ id, title: id, status, dependsOn, criterionIds: [], evidenceIds: [], createdAt: at, updatedAt: at });

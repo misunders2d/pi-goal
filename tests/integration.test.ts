@@ -50,7 +50,11 @@ function makeHarness(root: string, mode = "tui") {
 	const ctx: any = {
 		cwd: join(root, "workspace"), mode, hasUI: mode === "tui", model: undefined, modelRegistry: {},
 		isIdle: () => true, hasPendingMessages: () => false, abort: () => { aborts += 1; },
-		sessionManager: { getSessionId: () => "session-integration", getBranch: () => branch },
+		sessionManager: {
+			getSessionId: () => "session-integration",
+			getBranch: () => branch,
+			buildContextEntries: () => branch,
+		},
 		ui: {
 			notify(message: string, type?: string) { notifications.push({ message, type }); },
 			setStatus(id: string, value?: unknown) { statuses.push({ id, value }); },
@@ -117,7 +121,7 @@ test("planner requests clarification without workspace tools", async () => {
 		options = value;
 		return JSON.stringify({ status: "needs_clarification", questions: ["Which goal-mode lifecycle should be tested?"] });
 	};
-	const result = await runner.plan({ cwd: "/tmp/workspace" } as any, "testing the goal mode", []);
+	const result = await runner.plan({ cwd: "/tmp/workspace", sessionManager: { buildContextEntries: () => [] } } as any, "testing the goal mode", []);
 	assert.deepEqual(result, { kind: "clarification", questions: ["Which goal-mode lifecycle should be tested?"] });
 	assert.deepEqual(options.tools, []);
 	assert.match(options.systemPrompt, /Never infer unclear intent by inspecting the workspace/);
@@ -132,10 +136,66 @@ test("planner clarifies explicitly contradictory requirements without tools", as
 		assert.equal(JSON.parse(value.prompt).userOutcome, input);
 		return JSON.stringify({ status: "needs_clarification", questions: ["Should conflict.txt exist with READY content, or should its final state be absent?"] });
 	};
-	const result = await runner.plan({ cwd: "/tmp/workspace" } as any, input, [{ name: "read", description: "Read file", parameters: {} } as any]);
+	const result = await runner.plan({ cwd: "/tmp/workspace", sessionManager: { buildContextEntries: () => [] } } as any, input, [{ name: "read", description: "Read file", parameters: {} } as any]);
 	assert.deepEqual(result, { kind: "clarification", questions: ["Should conflict.txt exist with READY content, or should its final state be absent?"] });
 	assert.deepEqual(options.tools, []);
 	assert.match(options.systemPrompt, /If multiple materially different contracts are plausible/);
+});
+
+test("planner preserves long authoritative setup text without silent truncation", async () => {
+	const runner = new IsolatedModelRunner("/tmp/pi-goal-test-agent");
+	const outcome = `Build the complete target.\n${"Detailed requirement with exact semantics. ".repeat(180)}`;
+	const answer = `Clarification answer:\n${"Preserve this answered detail. ".repeat(100)}`;
+	let payload: any;
+	(runner as any).run = async (value: any) => {
+		payload = JSON.parse(value.prompt);
+		return JSON.stringify({ status: "needs_clarification", questions: ["One final question?"] });
+	};
+	await runner.plan({ cwd: "/tmp/workspace", model: { contextWindow: 128_000 }, sessionManager: { buildContextEntries: () => [] } } as any, outcome, [], undefined, [{ questions: ["Prior question"], answer }]);
+	assert.ok(outcome.length > 4_000);
+	assert.ok(answer.length > 2_000);
+	assert.equal(payload.userOutcome, outcome);
+	assert.equal(payload.clarifications[0].answer, answer);
+	assert.equal(payload.userOutcome.endsWith("…"), false);
+});
+
+test("planner receives bounded sanitized prior discussion without tool or extension cargo", async () => {
+	const runner = new IsolatedModelRunner("/tmp/pi-goal-test-agent");
+	const outcome = "do that";
+	const entries: any[] = [
+		{ type: "compaction", summary: "Earlier decision: keep the public API stable." },
+		{ type: "branch_summary", summary: "Branch decision: use the TypeScript implementation." },
+		{ type: "message", message: { role: "user", content: "Target package is pi-goal and success means no repeated questions." } },
+		{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "We agreed to preserve setup isolation." }, { type: "toolCall", id: "t1", name: "bash", arguments: { sentinel: "TOOL_CALL_SECRET" } }] } },
+		{ type: "message", message: { role: "toolResult", content: [{ type: "text", text: "TOOL_RESULT_SECRET" }] } },
+		{ type: "custom_message", customType: "hidden", content: "CUSTOM_MESSAGE_SECRET" },
+		{ type: "custom", customType: "state", data: { sentinel: "CUSTOM_STATE_SECRET" } },
+		{ type: "message", message: { role: "user", content: "/goal do that" } },
+	];
+	let payload: any;
+	(runner as any).run = async (value: any) => {
+		payload = JSON.parse(value.prompt);
+		return JSON.stringify({ status: "needs_clarification", questions: ["Confirm?"] });
+	};
+	await runner.plan({ cwd: "/tmp/workspace", model: { contextWindow: 128_000 }, sessionManager: { buildContextEntries: () => entries } } as any, outcome, []);
+	const discussion = JSON.stringify(payload.priorDiscussion);
+	assert.match(discussion, /public API stable/);
+	assert.match(discussion, /TypeScript implementation/);
+	assert.match(discussion, /Target package is pi-goal/);
+	assert.match(discussion, /preserve setup isolation/);
+	assert.doesNotMatch(discussion, /TOOL_CALL_SECRET|TOOL_RESULT_SECRET|CUSTOM_MESSAGE_SECRET|CUSTOM_STATE_SECRET|\/goal do that/);
+	assert.match(payload.priorDiscussion.note, /untrusted cargo/);
+});
+
+test("planner rejects oversized authoritative text explicitly before model execution", async () => {
+	const runner = new IsolatedModelRunner("/tmp/pi-goal-test-agent");
+	let called = false;
+	(runner as any).run = async () => { called = true; return "{}"; };
+	await assert.rejects(
+		() => runner.plan({ cwd: "/tmp/workspace", model: { contextWindow: 4_000 }, sessionManager: { buildContextEntries: () => [] } } as any, "x".repeat(10_000), []),
+		/no user text was truncated/,
+	);
+	assert.equal(called, false);
 });
 
 test("planning result is fail-closed and accepts only clarification or a complete ready contract", () => {

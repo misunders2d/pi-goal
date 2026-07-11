@@ -126,10 +126,13 @@ function goalContext(state: GoalState): string {
 	const steering = state.outcome.amendments.filter((item) => !item.consumedAt).map((item) => `- ${item.id}: ${item.text}`).join("\n") || "- none";
 	const evidence = state.evidence.slice(-20).map((item) => `- ${item.id}: ${item.kind}: ${item.summary}`).join("\n") || "- none";
 	const approvedChecks = state.verificationChecks.map((check) => approvedCheckContextLine(state, check)).join("\n") || "- none";
+	const originalOutcome = state.outcome.original === state.outcome.current
+		? `Outcome: ${state.outcome.current}`
+		: `Original user request (authoritative): ${state.outcome.original}\nContract outcome: ${state.outcome.current}`;
 	return `GOAL MODE ACTIVE
 Goal ID: ${state.goalId}
 Contract generation: ${state.generation}
-Outcome: ${state.outcome.current}
+${originalOutcome}
 Status: ${state.status}; phase: ${state.phase}
 Current action: ${state.currentAction}
 Next action: ${state.nextAction}
@@ -799,7 +802,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			catch (error) { ctx.ui.setWorkingMessage(); updateGoalUi(ctx, undefined); ctx.ui.notify(`Goal setup failed: ${error instanceof Error ? error.message : String(error)}`, "error"); return; }
 			ctx.ui.setWorkingMessage();
 			if (!draft) { updateGoalUi(ctx, undefined); ctx.ui.notify("Goal setup cancelled before contract creation.", "info"); return; }
-			let state = createGoalState(draft, ctx);
+			let state = createGoalState(draft, ctx, outcome);
 			store.set(state);
 			persist(ctx, "setup_created", "isolated planner created goal contract");
 			while (true) {
@@ -814,7 +817,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 						const replacementDraft = await designGoalContract(ctx, outcome, refinement);
 						if (!replacementDraft) { ctx.ui.notify("Goal refinement cancelled; the existing contract is unchanged.", "info"); continue; }
 						draft = replacementDraft;
-						const replacement = createGoalState(draft, ctx);
+						const replacement = createGoalState(draft, ctx, outcome);
 						replacement.goalId = state.goalId; replacement.createdAt = state.createdAt; replacement.generation = state.generation + 1;
 						state = replacement; store.set(state); persist(ctx, "setup_refined", "user refined setup contract");
 					} catch (error) { ctx.ui.notify(`Goal refinement failed: ${error instanceof Error ? error.message : String(error)}`, "error"); }
