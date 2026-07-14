@@ -17,8 +17,13 @@ for (const dependency of ["@earendil-works/pi-agent-core", "@earendil-works/pi-a
 	assert.equal(manifest.peerDependencies[dependency], "*", `${dependency} must be an unbundled Pi peer dependency`);
 }
 const output = execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { cwd: root, encoding: "utf8" });
-const pack = JSON.parse(output)[0];
-assert.ok(pack, "npm pack returned no manifest");
+const packOutput = JSON.parse(output) as unknown;
+const pack = Array.isArray(packOutput)
+	? packOutput[0]
+	: packOutput && typeof packOutput === "object"
+		? (packOutput as Record<string, unknown>)[manifest.name] ?? Object.values(packOutput as Record<string, unknown>)[0]
+		: undefined;
+assert.ok(pack && typeof pack === "object", "npm pack returned no manifest");
 const files = pack.files.map((entry: { path: string }) => entry.path);
 for (const forbidden of [/^node_modules\//, /^\.git\//, /(?:^|\/)state\.json$/, /events\.jsonl$/, /evidence\.json$/, /auth\.json$/, /\.env(?:\.|$)/]) {
 	assert.equal(files.some((path: string) => forbidden.test(path)), false, `tarball contains forbidden path matching ${forbidden}`);
