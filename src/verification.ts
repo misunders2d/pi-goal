@@ -59,7 +59,9 @@ function runProcess(
 				if (stderr.length < captureLimit) stderr += text.slice(0, captureLimit - stderr.length);
 				if (stderrBytes > captureLimit) stderrTruncated = true;
 			}
-			if (stdoutBytes + stderrBytes > 262_144) terminate();
+			// Stay below typical pipe capacity so a flooding child cannot block before
+			// the parent observes enough bytes to terminate it.
+			if (stdoutBytes + stderrBytes > 131_072) terminate();
 		};
 		child.stdout?.on("data", (chunk: Buffer) => consume(chunk, "stdout"));
 		child.stderr?.on("data", (chunk: Buffer) => consume(chunk, "stderr"));

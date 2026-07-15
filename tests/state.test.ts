@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { GoalStore, createGoalState, isSensitivePath, isWithinWorkspace, redactText, sha256, validateDag } from "../src/state.ts";
+import { GoalStore, createGoalState, isSensitivePath, isWithinWorkspace, normalizeState, redactText, sha256, validateDag } from "../src/state.ts";
 import type { GoalDraft } from "../src/types.ts";
 
 function fakeContext(cwd: string, branch: any[] = []) {
@@ -54,6 +54,19 @@ test("DAG validation rejects missing dependencies, cycles, and multiple active n
 	assert.match(validateDag([node("A", ["missing"])])[0]!, /missing/);
 	assert.ok(validateDag([node("A", ["B"]), node("B", ["A"])]).some((error) => error.includes("cycle")));
 	assert.ok(validateDag([node("A", [], "in_progress"), node("B", [], "in_progress")]).some((error) => error.includes("at most one")));
+});
+
+test("schema-1 normalization preserves legacy blocker counters and defaults new recovery fields", () => {
+	const raw: any = createGoalState(draft, fakeContext("/tmp/work"));
+	raw.repeatedBlockers = { legacy: 2 };
+	delete raw.recoveryEvidence;
+	delete raw.plan[0].commands;
+	const restored = normalizeState(raw)!;
+	assert.deepEqual(restored.repeatedBlockers, { legacy: 2 });
+	assert.deepEqual(restored.recoveryEvidence, []);
+	assert.deepEqual(restored.plan[0].commands, []);
+	delete raw.repeatedBlockers;
+	assert.deepEqual(normalizeState(raw)!.repeatedBlockers, {});
 });
 
 test("redaction and path boundaries fail closed", () => {

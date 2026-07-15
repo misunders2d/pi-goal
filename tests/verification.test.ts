@@ -94,6 +94,37 @@ test("command timeout is explicit and distinct from ordinary exit", async () => 
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("output flooding is terminated below pipe capacity with bounded diagnostics", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-output-flood-"));
+	try {
+		const result = await runVerificationCheck({ id: "FLOOD", kind: "command_exit", label: "flood", executable: "node", args: ["-e", "for(;;) process.stdout.write('x'.repeat(65536))"], timeoutMs: 5_000 }, root);
+		assert.equal(result.passed, false);
+		assert.notEqual(result.timedOut, true);
+		assert.equal(result.stdoutTruncated, true);
+		assert.ok((result.stdout?.length ?? 0) <= 8_193);
+		assert.ok((result.stdoutBytes ?? 0) > 131_072);
+		assert.ok(result.durationMs < 5_000);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("git diff failure summary is explicit without synthetic stdout or stderr", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-git-diff-"));
+	try {
+		execFileSync("git", ["init", "-q"], { cwd: root });
+		execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: root });
+		execFileSync("git", ["config", "user.name", "Test"], { cwd: root });
+		writeFileSync(join(root, "tracked.txt"), "before\n");
+		execFileSync("git", ["add", "--", "tracked.txt"], { cwd: root });
+		execFileSync("git", ["commit", "-qm", "initial"], { cwd: root });
+		writeFileSync(join(root, "tracked.txt"), "after\n");
+		const result = await runVerificationCheck({ id: "DIFF", kind: "git_diff", label: "clean diff", empty: true }, root);
+		assert.equal(result.passed, false);
+		assert.match(result.summary, /git diff contains changes/);
+		assert.equal(result.stdout, undefined);
+		assert.equal(result.stderr, undefined);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("git status check includes untracked files", async () => {
 	const root = mkdtempSync(join(tmpdir(), "pi-goal-git-"));
 	try {

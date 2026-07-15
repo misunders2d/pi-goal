@@ -20,19 +20,19 @@ Goal mode never weakens Pi's existing permission or confirmation gates. Workspac
 ## Install
 
 ```bash
-pi install npm:@misunders2d/pi-goal@1.0.13
+pi install npm:@misunders2d/pi-goal@1.0.14
 ```
 
 Try without installing:
 
 ```bash
-pi -e npm:@misunders2d/pi-goal@1.0.13
+pi -e npm:@misunders2d/pi-goal@1.0.14
 ```
 
 Pinned GitHub release:
 
 ```bash
-pi install git:github.com/misunders2d/pi-goal@v1.0.13
+pi install git:github.com/misunders2d/pi-goal@v1.0.14
 ```
 
 ## Use

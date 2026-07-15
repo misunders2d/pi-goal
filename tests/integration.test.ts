@@ -1091,3 +1091,57 @@ test("failed approved check counts as a safe RISK alternative", async () => {
 		assert.match(opened.content[0].text, /RISK interruption opened/);
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("successful find inspection counts as a safe RISK alternative", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-risk-find-alternative-"));
+	try {
+		const harness = makeHarness(root);
+		const state = injectRunning(harness);
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		assert.equal((await harness.emit("tool_call", { type: "tool_call", toolName: "records_create", toolCallId: "risk", input: { name: "external" } })).find(Boolean).block, true);
+		const input = { path: "src" };
+		await harness.emit("tool_call", { type: "tool_call", toolName: "find", toolCallId: "find-safe", input });
+		await harness.emit("tool_result", { type: "tool_result", toolName: "find", toolCallId: "find-safe", input, isError: false, content: [], details: {} });
+		assert.equal(latestState(harness).recoveryEvidence.some((item: any) => item.kind === "safe_alternative" && item.toolName === "find"), true);
+		const opened = await harness.tool("pi_goal_request_interrupt", { goalId: state.goalId, generation: state.generation, class: "RISK", message: "External action required", attempts: ["Inspected with find"], need: "Exact action", recommendation: "Approve once" });
+		assert.match(opened.content[0].text, /RISK interruption opened/);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("authority amendment rejects duplicate IDs without mutating the running goal", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-amend-duplicate-"));
+	try {
+		const harness = makeHarness(root);
+		mkdirSync(harness.ctx.cwd, { recursive: true });
+		const state = injectRunning(harness);
+		state.authorities.push({ ...commandAuthority("A-existing", harness.ctx.cwd, "local_process", ".venv/bin/pytest", []), uses: 0 });
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		await assert.rejects(() => harness.tool("pi_goal_request_authority_amendment", { goalId: state.goalId, generation: state.generation, rationale: "duplicate", authorities: [commandAuthority("A-existing", harness.ctx.cwd, "local_process", ".venv/bin/python", ["-m", "pytest"])] }), /already exists/);
+		assert.equal(latestState(harness).status, "running");
+		assert.equal(latestState(harness).authorities.length, 1);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("completion candidacy fails closed with missing evidence, background work, or no checks", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-completion-guards-"));
+	try {
+		const harness = makeHarness(root);
+		mkdirSync(harness.ctx.cwd, { recursive: true });
+		const state = injectRunning(harness);
+		state.verificationChecks = [];
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		await assert.rejects(() => harness.tool("pi_goal_submit_completion_candidate", { goalId: state.goalId, generation: state.generation, summary: "premature" }), /Every criterion needs linked evidence/);
+		const readInput = { path: "README.md" };
+		await harness.emit("tool_call", { type: "tool_call", toolName: "read", toolCallId: "evidence-read", input: readInput });
+		await harness.emit("tool_result", { type: "tool_result", toolName: "read", toolCallId: "evidence-read", input: readInput, isError: false, content: [], details: {} });
+		await harness.tool("pi_goal_record_evidence", { goalId: state.goalId, generation: state.generation, summary: "criterion evidence", criterionIds: ["AC1"] });
+		harness.pi.events.emit("pi-goal:background-start", { id: "job", label: "work" });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		await assert.rejects(() => harness.tool("pi_goal_submit_completion_candidate", { goalId: state.goalId, generation: state.generation, summary: "background" }), /Background work is still active/);
+		harness.pi.events.emit("pi-goal:background-end", { id: "job" });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		const rejected = await harness.tool("pi_goal_submit_completion_candidate", { goalId: state.goalId, generation: state.generation, summary: "no checks" });
+		assert.match(rejected.content[0].text, /rejected by approved checks/);
+		assert.equal(latestState(harness).completionCandidate, false);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});

@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { hardCommandDenyReason, parseSimpleCommand, requiredCommandClasses } from "../src/authority.ts";
 import { authorityMatches, classifyToolCall, isGoalPrivatePath, toolDeclaresBackground } from "../src/security.ts";
 import { createGoalState, inputHash } from "../src/state.ts";
 import type { GoalDraft } from "../src/types.ts";
@@ -129,6 +130,13 @@ test("typed executable policies compose local, network, and exact Git authority"
 		for (const command of ["uv run pytest -q tests/unit", ".venv/bin/python -m pytest -q tests/unit", ".venv/bin/pytest -q tests/unit", "git add -- src/a.py", "git commit -m safe-message", "git push origin feature/safe"]) assert.equal(classifyToolCall(goal, "bash", { command }).allow, true, command);
 		for (const command of ["uv sync", "git add .", "git add -A", "git reset --hard", "git clean -fd", "git checkout -- .", "git rebase main", "git push --force origin feature/safe", "git push origin other", "rm -rf src", "npm publish"]) assert.equal(classifyToolCall(goal, "bash", { command }).allow, false, command);
 	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("offline uv composition and read-only systemctl carve-out are exact", () => {
+	for (const command of ["uv --offline run pytest -q tests/unit", "uv run --no-network pytest -q tests/unit"]) assert.deepEqual(requiredCommandClasses(parseSimpleCommand(command, "/tmp").command!), ["local_process"]);
+	assert.deepEqual(requiredCommandClasses(parseSimpleCommand("uv run pytest -q tests/unit", "/tmp").command!), ["local_process", "network_read"]);
+	assert.equal(hardCommandDenyReason(parseSimpleCommand("systemctl --failed", "/tmp").command!), undefined);
+	assert.match(hardCommandDenyReason(parseSimpleCommand("systemctl status sshd", "/tmp").command!) ?? "", /privileged|service|infrastructure/);
 });
 
 test("unknown custom mutation fails closed while provable reads pass", () => {
