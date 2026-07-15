@@ -9,6 +9,7 @@ import {
 	type ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { validateCommandAuthorityDefinition, validateDraftCommandAuthorities } from "./authority.ts";
 import { IsolatedModelRunner, normalizeDraft } from "./evaluator.ts";
 import {
 	classifyToolCall,
@@ -42,6 +43,7 @@ import type {
 	GoalNode,
 	GoalSetupTranscript,
 	GoalState,
+	RecoveryEvidence,
 	InterruptClass,
 	VerificationCheck,
 	VerificationResult,
@@ -55,6 +57,7 @@ const GOAL_TOOL_NAMES = new Set([
 	"pi_goal_record_evidence",
 	"pi_goal_apply_steering",
 	"pi_goal_request_interrupt",
+	"pi_goal_request_authority_amendment",
 	"pi_goal_submit_completion_candidate",
 	"pi_goal_status",
 ]);
@@ -142,6 +145,19 @@ function approvedCheckContextLine(state: GoalState, check: VerificationCheck): s
 	}
 }
 
+function failedCheckDiagnostic(state: GoalState, check: VerificationCheck, result: VerificationResult): string {
+	const lines = [
+		`Approved check ${check.id} failed.`,
+		approvedCheckContextLine(state, check).replace(/^[- ]+/, ""),
+		`exitCode=${result.exitCode ?? "none"} timedOut=${result.timedOut === true} aborted=${result.aborted === true} signal=${result.signal ?? "none"}`,
+		`stdoutBytes=${result.stdoutBytes ?? 0} stdoutTruncated=${result.stdoutTruncated === true}`,
+		`stderrBytes=${result.stderrBytes ?? 0} stderrTruncated=${result.stderrTruncated === true}`,
+		`stdout:\n${result.stdout || "[empty]"}`,
+		`stderr:\n${result.stderr || "[empty]"}`,
+	];
+	return redactText(lines.join("\n"), 18_000).text;
+}
+
 function goalContext(state: GoalState): string {
 	const criteria = state.criteria.map((criterion) => `- ${criterion.id}: ${criterion.text} [${criterion.status}]`).join("\n");
 	const plan = state.plan.map((node) => `- ${node.id}: ${node.title} [${node.status}] deps=${node.dependsOn.join(",") || "none"}`).join("\n");
@@ -186,6 +202,7 @@ Rules:
 - Use pi_goal_record_evidence after successful work. Omit internal node, criterion, and tool-call IDs when one current step exists; the tool infers them. Narrative alone is not proof.
 - Use pi_goal_apply_steering only for a real unconsumed user steering ID.
 - Use pi_goal_request_interrupt only for CREDENTIAL, DECISION, RISK, or a BLOCKER that survived bounded recovery.
+- If an approved running goal omitted a necessary executable, use pi_goal_request_authority_amendment with the narrow exact command policies; never ask to recreate the goal or broaden Bash.
 - A blocked or denied action is not automatically a user-facing RISK. Abandon optional denied actions and try safe in-envelope alternatives. Request RISK only when the exact blocked action is necessary to the approved outcome and safe alternatives have been attempted.
 - Use pi_goal_submit_completion_candidate only when every criterion has linked evidence and approved checks should pass.
 - Prefer typed tools and approved final checks. Use pi_goal_run_check with a setup-approved check ID whenever its immutable command/test is needed during execution; do not ask the user for separate authority to run that check.
@@ -213,7 +230,8 @@ Rules:
 - Debate conflicting requirements with the user here. Do not inspect or modify workspace, run commands, browse, send, or use other operational tools before contract approval.
 - When target, scope, success criteria, verification, and authority are clear, call pi_goal_submit_contract with the complete contract. Do not merely print contract JSON.
 - Current user messages and explicit corrections override older discussion.
-- Contract must preserve complete original request and define observable criteria, ordered phases, mechanical checks, constraints, non-goals, and all foreseeable typed authorities needed for fire-and-forget completion.
+- Contract must preserve complete original request and define observable criteria, ordered phases, machine-readable phase commands, mechanical checks, constraints, non-goals, and all foreseeable typed authorities needed for fire-and-forget completion.
+- Every Bash authority must include exact cwd plus a command policy with exact executable, exact argsPrefix, and bounded trailingArgs. Provide every required action class: uv normally needs local_process and network_read; git push needs local_process and external_write. Labels/prose never grant authority.
 - One later user approval covers contract plus declared authority envelope. Make envelope complete enough that routine work, tests, commits, pushes, requested external writes, and other foreseeable actions do not require mid-run approval.
 - Keep authorities scoped to approved goal. Never include credentials or secret values. Human-only credentials, tool-native confirmations, and genuinely irreversible actions cannot be silently bypassed.
 - Until approval, only pi_goal_submit_contract and pi_goal_status may be called.`;
@@ -291,7 +309,29 @@ function findBackgroundMetadata(value: unknown): { id?: string; state?: string; 
 }
 
 function validGeneration(state: GoalState, goalId: string, generation: number): void {
-	if (state.goalId !== goalId || state.generation !== generation) throw new Error("Stale goal ID or generation; refresh pi_goal_status before changing goal state.");
+	if (state.goalId !== goalId || state.generation !== generation) {
+		throw new Error(`Stale goal ID or generation. Requested goalId=${goalId} generation=${generation}; current goalId=${state.goalId} generation=${state.generation}. Call pi_goal_status, then retry the same operation with the current goalId and generation. No state was changed.`);
+	}
+}
+
+function addRecoveryEvidence(state: GoalState, evidence: Omit<RecoveryEvidence, "id" | "createdAt">): RecoveryEvidence {
+	const record: RecoveryEvidence = { id: makeId("recovery"), createdAt: now(), ...evidence };
+	if (!state.recoveryEvidence.some((item) => item.kind === record.kind && item.fingerprint === record.fingerprint)) state.recoveryEvidence.push(record);
+	return record;
+}
+
+function blockerReadiness(state: GoalState): { ready: boolean; distinct: number; replanned: boolean; message: string } {
+	const attempts = state.recoveryEvidence.filter((item) => item.kind === "authority_denial" || item.kind === "check_failure");
+	const distinct = new Set(attempts.map((item) => item.fingerprint)).size;
+	const firstAt = attempts.map((item) => Date.parse(item.createdAt)).filter(Number.isFinite).sort((a, b) => a - b)[0];
+	const replanned = firstAt !== undefined && state.recoveryEvidence.some((item) => item.kind === "replan" && Date.parse(item.createdAt) >= firstAt);
+	const unmet = [distinct < 3 ? `need 3 distinct tool-evidenced denials/check failures; have ${distinct}` : "", !replanned ? "need one successful replan after the first denial" : ""].filter(Boolean);
+	return { ready: !unmet.length, distinct, replanned, message: unmet.length ? `BLOCKER unmet: ${unmet.join("; ")}.` : "BLOCKER recovery evidence satisfied." };
+}
+
+function hasSafeRiskAlternative(state: GoalState): boolean {
+	const createdAt = Date.parse(state.deferredRisk?.createdAt ?? "");
+	return !!state.deferredRisk && (state.deferredRisk.alternativeToolCallIds.length > 0 || state.recoveryEvidence.some((item) => (item.kind === "safe_alternative" || item.kind === "check_failure") && Date.parse(item.createdAt) >= createdAt));
 }
 
 function normalizePlanNodes(state: GoalState, values: Array<{ id: string; title: string; description?: string; status: string; dependsOn?: string[]; criterionIds?: string[] }>): GoalNode[] {
@@ -305,6 +345,7 @@ function normalizePlanNodes(state: GoalState, values: Array<{ id: string; title:
 			id: value.id.trim(),
 			title: redactText(value.title, 200).text,
 			description: value.description ? redactText(value.description, 500).text : undefined,
+			commands: previous?.commands ?? [],
 			status,
 			dependsOn: value.dependsOn ?? [],
 			criterionIds: (value.criterionIds ?? []).filter((id) => criteria.has(id)),
@@ -341,6 +382,21 @@ function buildRiskAuthority(state: GoalState): ActionAuthority | undefined {
 		maxUses: 1,
 		uses: 0,
 	};
+}
+
+function applyPendingAuthorityAmendment(state: GoalState): number {
+	const pending = state.interrupt?.pendingAuthorityAmendment;
+	if (!pending) return 0;
+	for (const authority of pending.authorities) state.authorities.push({ ...authority, targets: [...authority.targets], command: authority.command ? { ...authority.command, argsPrefix: [...authority.command.argsPrefix] } : undefined, uses: 0 });
+	state.interrupt = undefined;
+	state.status = "running";
+	state.phase = pending.resumePhase;
+	state.currentAction = pending.resumeCurrentAction;
+	state.nextAction = pending.resumeNextAction;
+	state.generation += 1;
+	state.continuationSequence += 1;
+	state.lastContinuationKey = undefined;
+	return pending.authorities.length;
 }
 
 function isActiveGoal(state: GoalState | undefined): state is GoalState {
@@ -755,13 +811,12 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			} else if (decision.action === "interrupt" && decision.interrupt) {
 				const requested = decision.interrupt;
 				if (requested.class === "BLOCKER") {
-					const signature = interruptSignature(requested);
-					state.repeatedBlockers[signature] = (state.repeatedBlockers[signature] ?? 0) + 1;
-					if (state.repeatedBlockers[signature] >= 3) openInterrupt(state, requested);
-					else { state.phase = "recovering"; state.nextAction = "Try a materially different recovery path before declaring BLOCKER"; }
+					const readiness = blockerReadiness(state);
+					if (readiness.ready) openInterrupt(state, requested);
+					else { state.phase = "recovering"; state.nextAction = readiness.message; }
 				} else if (requested.class === "RISK") {
 					const candidate = state.deferredRisk;
-					if (candidate?.alternativeToolCallIds.length) {
+					if (candidate && hasSafeRiskAlternative(state)) {
 						openInterrupt(state, { ...requested, pendingAction: { toolName: candidate.toolName, inputHash: candidate.inputHash, label: candidate.label, actionClass: candidate.actionClass } });
 						state.deferredRisk = undefined;
 					} else {
@@ -804,7 +859,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 					state.status = "paused"; state.continuationSequence += 1; state.lastContinuationKey = undefined; state.currentAction = "Paused by user"; changed = true;
 				} else {
 					const resumesPaused = state.status === "paused" && !state.interrupt;
-					const resumesNonRiskInterrupt = state.status === "interrupted" && !!state.interrupt && !state.interrupt.pendingAction;
+					const resumesNonRiskInterrupt = state.status === "interrupted" && !!state.interrupt && !state.interrupt.pendingAction && !state.interrupt.pendingAuthorityAmendment;
 					if (!resumesPaused && !resumesNonRiskInterrupt) return;
 					if (resumesNonRiskInterrupt) state.interrupt = undefined;
 					state.status = "running"; state.phase = "recovering"; state.continuationSequence += 1; state.lastContinuationKey = undefined; state.currentAction = "Resuming goal"; scheduleVerificationRecoveryTimeout(ctx, state); changed = true;
@@ -813,6 +868,16 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				if (action === "resume") triggerContinuation(state, "Resume from durable state and inspect current evidence before acting.");
 			});
 			if (action === "pause" && changed) { ctx.abort(); await isolated.abortAll(); }
+			return;
+		}
+		if (action === "approve_amendment") {
+			if (!await ctx.ui.confirm("Approve exact typed authority amendment?", "This adds only the displayed executable, argv, action-class, and cwd policies. Existing goal state is preserved.")) return;
+			await mutex.run(() => {
+				const state = load(ctx); if (!state) return;
+				const count = applyPendingAuthorityAmendment(state); if (!count) return;
+				persist(ctx, "authority_amendment_approved", `${count} exact typed authorities approved`);
+				triggerContinuation(state, "The user approved the displayed typed authority amendment. Continue the same current step without broadening it.");
+			});
 			return;
 		}
 		if (action === "approve_risk") {
@@ -958,12 +1023,25 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		Type.Object({ id: Type.String(), kind: Type.Literal("git_status"), label: Type.String(), clean: Type.Optional(Type.Boolean()) }),
 		Type.Object({ id: Type.String(), kind: Type.Literal("git_diff"), label: Type.String(), empty: Type.Optional(Type.Boolean()), paths: Type.Optional(Type.Array(Type.String())) }),
 	]);
+	const ActionClassParameter = Type.Union([Type.Literal("workspace_read"), Type.Literal("workspace_write"), Type.Literal("local_process"), Type.Literal("network_read"), Type.Literal("external_write"), Type.Literal("publication"), Type.Literal("destructive")]);
+	const CommandPolicyParameter = Type.Object({
+		executable: Type.String(),
+		argsPrefix: Type.Array(Type.String()),
+		trailingArgs: Type.Union([Type.Literal("none"), Type.Literal("any"), Type.Literal("workspace_paths"), Type.Literal("single_value")]),
+	});
+	const CommandInvocationParameter = Type.Object({
+		executable: Type.String(),
+		args: Type.Array(Type.String()),
+		cwd: Type.Optional(Type.String()),
+		actionClasses: Type.Optional(Type.Array(ActionClassParameter)),
+	});
 	const AuthorityParameter = Type.Object({
 		id: Type.String(),
 		label: Type.String(),
-		actionClass: Type.Union([Type.Literal("workspace_read"), Type.Literal("workspace_write"), Type.Literal("local_process"), Type.Literal("network_read"), Type.Literal("external_write"), Type.Literal("publication"), Type.Literal("destructive")]),
+		actionClass: ActionClassParameter,
 		toolName: Type.String(),
 		targets: Type.Array(Type.Object({ path: Type.String(), equals: Type.Union([Type.String(), Type.Number(), Type.Boolean(), Type.Null()]) })),
+		command: Type.Optional(CommandPolicyParameter),
 		inputHash: Type.Optional(Type.String()),
 		maxUses: Type.Integer({ minimum: 1, maximum: 100 }),
 		expiresAt: Type.Optional(Type.String()),
@@ -977,7 +1055,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			...Expected,
 			outcome: Type.Optional(Type.String()),
 			criteria: Type.Array(Type.String(), { minItems: 1 }),
-			phases: Type.Array(Type.Object({ id: Type.Optional(Type.String()), title: Type.String(), description: Type.Optional(Type.String()), dependsOn: Type.Optional(Type.Array(Type.String())), criterionIds: Type.Optional(Type.Array(Type.String())) }), { minItems: 1 }),
+			phases: Type.Array(Type.Object({ id: Type.Optional(Type.String()), title: Type.String(), description: Type.Optional(Type.String()), commands: Type.Optional(Type.Array(CommandInvocationParameter)), dependsOn: Type.Optional(Type.Array(Type.String())), criterionIds: Type.Optional(Type.Array(Type.String())) }), { minItems: 1 }),
 			verificationChecks: Type.Array(VerificationCheckParameter, { minItems: 1 }),
 			authorities: Type.Array(AuthorityParameter),
 			constraints: Type.Array(Type.String()),
@@ -989,6 +1067,8 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			validGeneration(state, params.goalId, params.generation);
 			const draft = normalizeDraft(params, state.outcome.original, ctx.cwd);
 			normalizeAuthorityToolNames(draft);
+			const commandAuthorityErrors = validateDraftCommandAuthorities(draft, ctx.cwd);
+			if (commandAuthorityErrors.length) throw new Error(`Contract executable authority is incomplete: ${commandAuthorityErrors.join("; ")}`);
 			const replacement = createGoalState(draft, ctx, state.outcome.original);
 			replacement.goalId = state.goalId;
 			replacement.createdAt = state.createdAt;
@@ -1011,8 +1091,48 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		parameters: Type.Object({ ...Expected, reason: Type.String(), nodes: Type.Array(Type.Object({ id: Type.String(), title: Type.String(), description: Type.Optional(Type.String()), status: Type.String(), dependsOn: Type.Optional(Type.Array(Type.String())), criterionIds: Type.Optional(Type.Array(Type.String())) }), { minItems: 1 }) }),
 		execute: async (_id, params, _signal, _update, ctx) => mutex.run(() => {
 			const state = load(ctx); if (!state || state.status !== "running") throw new Error("No running goal"); validGeneration(state, params.goalId, params.generation);
-			state.plan = normalizePlanNodes(state, params.nodes); state.phase = "planning"; state.currentAction = currentNode(state)?.title ?? "Replanned goal"; state.nextAction = state.plan.find((node) => node.status === "pending")?.title ?? "Verify outcome";
+			state.plan = normalizePlanNodes(state, params.nodes);
+			state.phase = "planning";
+			state.currentAction = currentNode(state)?.title ?? "Replanned goal";
+			state.nextAction = state.plan.find((node) => node.status === "pending")?.title ?? "Verify outcome";
+			state.noProgressCount = 0;
+			state.repeatedToolCalls = {};
+			state.repeatedBlockers = {};
+			state.lastContinuationKey = undefined;
+			state.continuationSequence += 1;
+			addRecoveryEvidence(state, { kind: "replan", fingerprint: sha256(`replan\n${params.reason}\n${JSON.stringify(params.nodes)}`), summary: redactText(params.reason, 300).text, nodeId: currentNode(state)?.id });
 			persist(ctx, "plan_updated", params.reason); return toolResult(`Plan updated. Current: ${state.currentAction}`);
+		}),
+	});
+
+	pi.registerTool({
+		name: "pi_goal_request_authority_amendment",
+		label: "Request Goal Authority Amendment",
+		description: "Request one narrowly scoped human-approved authority amendment without replacing the goal, plan, criteria, evidence, or workspace.",
+		parameters: Type.Object({ ...Expected, rationale: Type.String(), authorities: Type.Array(AuthorityParameter, { minItems: 1 }) }),
+		execute: async (_id, params, _signal, _update, ctx) => mutex.run(() => {
+			const state = load(ctx); if (!state || state.status !== "running") throw new Error("No running goal"); validGeneration(state, params.goalId, params.generation);
+			const authorities = params.authorities.map((authority) => ({ ...authority, targets: [...authority.targets], command: authority.command ? { ...authority.command, argsPrefix: [...authority.command.argsPrefix] } : undefined }));
+			const shell: GoalDraft = { outcome: state.outcome.current, criteria: state.criteria.map((item) => item.text), phases: [], verificationChecks: [], authorities, constraints: [], nonGoals: [] };
+			normalizeAuthorityToolNames(shell);
+			const duplicate = authorities.find((authority) => state.authorities.some((existing) => existing.id === authority.id));
+			if (duplicate) throw new Error(`Authority amendment ID already exists: ${duplicate.id}`);
+			const errors = authorities.flatMap((authority) => validateCommandAuthorityDefinition(authority, state.cwd).map((error) => `${authority.id} ${JSON.stringify(authority.label)}: ${error}`));
+			if (errors.length) throw new Error(`Authority amendment is invalid: ${errors.join("; ")}`);
+			const rationale = redactText(params.rationale, 500).text;
+			const resumePhase = state.phase;
+			const resumeCurrentAction = state.currentAction;
+			const resumeNextAction = state.nextAction;
+			openInterrupt(state, {
+				class: "RISK",
+				message: `Narrow authority amendment requested: ${rationale}`,
+				attempts: state.recoveryEvidence.filter((item) => item.kind === "authority_denial" || item.kind === "check_failure").slice(-8).map((item) => item.summary),
+				need: "Human approval for only the displayed typed executable authorities.",
+				recommendation: "Review the exact executable, argv policy, action class, and cwd; approve or reject the amendment.",
+				pendingAuthorityAmendment: { authorities, rationale, requestedAt: now(), resumePhase, resumeCurrentAction, resumeNextAction },
+			});
+			persist(ctx, "authority_amendment_requested", rationale);
+			return toolResult("Authority amendment is awaiting exact human approval through bare /goal or the exact approval phrase.");
 		}),
 	});
 
@@ -1096,16 +1216,16 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			const state = load(ctx); if (!state || state.status !== "running") throw new Error("No running goal"); validGeneration(state, params.goalId, params.generation);
 			const request: Omit<GoalInterrupt, "createdAt" | "signature"> = { class: params.class as InterruptClass, message: params.message, attempts: params.attempts, need: params.need, recommendation: params.recommendation };
 			if (request.class === "BLOCKER") {
-				const signature = interruptSignature(request); state.repeatedBlockers[signature] = (state.repeatedBlockers[signature] ?? 0) + 1;
-				if (state.repeatedBlockers[signature] < 3) {
-					persist(ctx, "blocker_encounter", `BLOCKER encounter ${state.repeatedBlockers[signature]} of 3: ${request.message}`);
-					throw new Error("BLOCKER requires three repeated evidence-backed encounters. Recover or replan first.");
+				const readiness = blockerReadiness(state);
+				if (!readiness.ready) {
+					persist(ctx, "blocker_unmet", readiness.message);
+					throw new Error(readiness.message);
 				}
 			}
 			if (request.class === "RISK") {
 				const candidate = state.deferredRisk;
 				if (!candidate) throw new Error("RISK requires an exact action previously blocked by goal safety.");
-				if (!candidate.alternativeToolCallIds.length) throw new Error("RISK requires evidence of at least one safe alternative attempt after the blocked action.");
+				if (!hasSafeRiskAlternative(state)) throw new Error("RISK unmet: need evidence of at least one safe alternative attempt after the exact blocked action; an approved-check attempt or successful read-only fallback qualifies; have none.");
 				request.pendingAction = { toolName: candidate.toolName, inputHash: candidate.inputHash, label: candidate.label, actionClass: candidate.actionClass };
 			}
 			openInterrupt(state, request); state.deferredRisk = undefined; persist(ctx, "interrupt_opened", `${request.class}: ${request.message}`); return toolResult(`${request.class} interruption opened.`);
@@ -1166,13 +1286,19 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				sequence = state.continuationSequence;
 			});
 			const result = await runVerificationCheck(check!, ctx.cwd, signal);
-			if (!result.passed) throw new Error(`Approved check ${params.checkId} failed: ${result.summary}`);
+			let diagnostic: string | undefined;
 			await mutex.run(() => {
 				const state = load(ctx);
-				if (!state || (state.status !== "running" && state.status !== "auditing")) throw new Error("Goal changed while approved check was running");
+				if (!state || (state.status !== "running" && state.status !== "auditing")) throw new Error("Goal changed while approved check was running; call pi_goal_status and retry against the active goal.");
 				validGeneration(state, params.goalId, params.generation);
-				if (state.continuationSequence !== sequence) throw new Error("Goal changed while approved check was running");
+				if (state.continuationSequence !== sequence) throw new Error(`Goal changed while approved check was running; current generation=${state.generation} sequence=${state.continuationSequence}. Call pi_goal_status and retry.`);
+				if (!result.passed) {
+					diagnostic = failedCheckDiagnostic(state, check!, result);
+					addRecoveryEvidence(state, { kind: "check_failure", fingerprint: sha256(`check\n${params.checkId}\n${result.summary}`), summary: `Approved check ${params.checkId} failed: ${result.summary}`, checkId: params.checkId, toolName: "pi_goal_run_check" });
+					persist(ctx, "approved_check_failed", `Approved check ${params.checkId} failed: ${result.summary}`);
+				}
 			});
+			if (!result.passed) throw new Error(diagnostic!);
 			return toolResult(JSON.stringify(result), result as unknown as Record<string, unknown>);
 		},
 	});
@@ -1300,23 +1426,30 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			}
 			if (/^(?:resume|resume goal|resume the goal)$/i.test(text)) {
 				const resumesPaused = state.status === "paused" && !state.interrupt;
-				const resumesNonRiskInterrupt = state.status === "interrupted" && !!state.interrupt && !state.interrupt.pendingAction;
+				const resumesNonRiskInterrupt = state.status === "interrupted" && !!state.interrupt && !state.interrupt.pendingAction && !state.interrupt.pendingAuthorityAmendment;
 				if (resumesPaused || resumesNonRiskInterrupt) {
 					if (resumesNonRiskInterrupt) state.interrupt = undefined;
 					state.status = "running"; state.phase = "recovering"; state.continuationSequence += 1; state.lastContinuationKey = undefined; scheduleVerificationRecoveryTimeout(ctx, state); persist(ctx, "goal_resumed", "natural-language resume"); triggerContinuation(state, "Resume from durable state and inspect current evidence before acting.");
 				} else if (state.interrupt?.pendingAction) ctx.ui.notify("Exact pending RISK requires approval or resolution; resume cannot grant authority.", "warning");
+				else if (state.interrupt?.pendingAuthorityAmendment) ctx.ui.notify("Exact pending authority amendment requires approval or resolution; resume cannot grant authority.", "warning");
 				return { action: "handled" as const };
 			}
 			if (/^(?:cancel|cancel goal|cancel the goal|stop goal|stop the goal)$/i.test(text)) {
 				clearVerificationRecoveryTimer();
 				state.status = "cancelled"; state.phase = "done"; state.continuationSequence += 1; state.lastContinuationKey = undefined; persist(ctx, "goal_cancelled", "natural-language cancellation"); updateGoalUi(ctx, undefined); abortActive = true; return { action: "handled" as const };
 			}
+			if (/^approve exact authority amendment$/i.test(text) && state.interrupt?.pendingAuthorityAmendment) {
+				const count = applyPendingAuthorityAmendment(state);
+				persist(ctx, "authority_amendment_approved", `${count} exact typed authorities approved by natural-language phrase`);
+				triggerContinuation(state, "The user approved the displayed typed authority amendment. Continue the same current step without broadening it.");
+				return { action: "handled" as const };
+			}
 			if (/^approve exact pending risk once$/i.test(text) && state.interrupt?.pendingAction) {
 				const authority = buildRiskAuthority(state); if (authority) state.authorities.push(authority);
 				state.interrupt = undefined; state.status = "running"; state.phase = "recovering"; state.generation += 1; state.continuationSequence += 1; state.lastContinuationKey = undefined; persist(ctx, "risk_approved", "natural-language exact pending-risk approval"); triggerContinuation(state, "Retry only the exact pending action approved by the user."); return { action: "handled" as const };
 			}
-			if (/^approve\b/i.test(text) && state.interrupt?.pendingAction) {
-				ctx.ui.notify('Exact approval required: type "approve exact pending risk once" or use bare /goal.', "warning");
+			if (/^approve\b/i.test(text) && (state.interrupt?.pendingAction || state.interrupt?.pendingAuthorityAmendment)) {
+				ctx.ui.notify(state.interrupt?.pendingAuthorityAmendment ? 'Exact approval required: type "approve exact authority amendment" or use bare /goal.' : 'Exact approval required: type "approve exact pending risk once" or use bare /goal.', "warning");
 				return { action: "handled" as const };
 			}
 			if (isInformationalGoalInput(text)) return;
@@ -1379,6 +1512,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			const safeReason = redactText(decision.reason ?? "outside approved authority", 300).text;
 			if (decision.recoverable) {
 				const guidance = recoverableDenialGuidance(event.toolName);
+				addRecoveryEvidence(state, { kind: "authority_denial", fingerprint: sha256(`denial\n${event.toolName}\n${hash}`), summary: `${event.toolName}: ${safeReason}`, toolCallId: event.toolCallId, toolName: event.toolName });
 				persist(ctx, "tool_soft_denied", `${event.toolName}: ${safeReason}`);
 				return { block: true, reason: `Goal recoverable denial: ${safeReason}. ${guidance}` };
 			}
@@ -1392,6 +1526,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			state.deferredRisk = existing?.toolName === event.toolName && existing.inputHash === hash
 				? { ...existing, denials: existing.denials + 1 }
 				: { toolName: event.toolName, inputHash: hash, label: `${event.toolName}: ${safeReason}`, actionClass: decision.actionClass, denials: 1, alternativeToolCallIds: [], createdAt: now() };
+			addRecoveryEvidence(state, { kind: "authority_denial", fingerprint: sha256(`denial\n${event.toolName}\n${hash}`), summary: `${event.toolName}: ${safeReason}`, toolCallId: event.toolCallId, toolName: event.toolName });
 			state.completionCandidate = false;
 			state.phase = "recovering";
 			state.currentAction = "Recovering from blocked unapproved action";
@@ -1399,11 +1534,12 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			persist(ctx, "tool_hard_denied", `${event.toolName}: ${safeReason}`);
 			return { block: true, reason: `Goal blocked unapproved action: ${safeReason}. Continue with a safe alternative; request RISK only if this exact action is necessary after alternative attempts.` };
 		}
-		if (decision.authorityId) {
-			const authority = state.authorities.find((item) => item.id === decision.authorityId);
-			if (!authority) return { block: true, reason: "Approved authority disappeared before use." };
-			authority.uses += 1;
-			persist(ctx, "authority_consumed", `one approved ${event.toolName} attempt consumed`);
+		const authorityIds = decision.authorityIds ?? (decision.authorityId ? [decision.authorityId] : []);
+		if (authorityIds.length) {
+			const authorities = authorityIds.map((id) => state.authorities.find((item) => item.id === id));
+			if (authorities.some((authority) => !authority)) return { block: true, reason: "Approved authority disappeared before use." };
+			for (const authority of authorities) authority!.uses += 1;
+			persist(ctx, "authority_consumed", `${authorityIds.length} approved ${event.toolName} authority class${authorityIds.length === 1 ? "" : "es"} consumed`);
 		}
 	}));
 
@@ -1423,6 +1559,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			if (event.toolName === "edit" || event.toolName === "write") state.repeatedToolCalls = {};
 		}
 		state.observations.push({ toolCallId: event.toolCallId, toolName: event.toolName, inputHash: observedHash, isError: event.isError, exitCode: toolExitCode(event), paths, createdAt: now() });
+		if (!event.isError && ["read", "grep", "find", "ls"].includes(event.toolName)) addRecoveryEvidence(state, { kind: "safe_alternative", fingerprint: sha256(`alternative\n${event.toolCallId}`), summary: `${event.toolName} read-only fallback succeeded`, toolCallId: event.toolCallId, toolName: event.toolName });
 		if (!event.isError && event.toolName !== "pi_goal_run_check" && state.deferredRisk && observedHash !== state.deferredRisk.inputHash && !state.deferredRisk.alternativeToolCallIds.includes(event.toolCallId)) {
 			state.deferredRisk.alternativeToolCallIds.push(event.toolCallId);
 		}

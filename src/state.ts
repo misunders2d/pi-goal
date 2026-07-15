@@ -164,6 +164,7 @@ function normalizeAuthority(authority: Omit<ActionAuthority, "uses">, index: num
 		uses: 0,
 		maxUses: Math.max(1, Math.min(100, authority.maxUses || 1)),
 		targets: authority.targets ?? [],
+		command: authority.command ? { ...authority.command, argsPrefix: [...authority.command.argsPrefix] } : undefined,
 	};
 }
 
@@ -203,6 +204,7 @@ export function createGoalSetupState(outcome: string, ctx: ExtensionContext): Go
 		noProgressCount: 0,
 		repeatedToolCalls: {},
 		repeatedBlockers: {},
+		recoveryEvidence: [],
 		activeToolCalls: {},
 		backgroundWork: {},
 		setupAwaitingUser: false,
@@ -222,6 +224,7 @@ export function createGoalState(draft: GoalDraft, ctx: ExtensionContext, origina
 		id: phase.id?.trim() || `P${index + 1}`,
 		title: redactText(phase.title, 200).text,
 		description: phase.description ? redactText(phase.description, 500).text : undefined,
+		commands: (phase.commands ?? []).map((command) => ({ ...command, args: [...command.args], actionClasses: command.actionClasses ? [...command.actionClasses] : undefined })),
 		status: index === 0 ? "in_progress" : "pending",
 		dependsOn: phase.dependsOn ?? (index > 0 ? [`P${index}`] : []),
 		criterionIds: (phase.criterionIds ?? []).filter((id) => criterionIds.has(id)),
@@ -268,6 +271,7 @@ export function createGoalState(draft: GoalDraft, ctx: ExtensionContext, origina
 		noProgressCount: 0,
 		repeatedToolCalls: {},
 		repeatedBlockers: {},
+		recoveryEvidence: [],
 		activeToolCalls: {},
 		backgroundWork: {},
 	};
@@ -287,6 +291,7 @@ export function normalizeState(raw: unknown): GoalState | undefined {
 	) return undefined;
 	value.generation = Number.isInteger(value.generation) ? value.generation : 1;
 	value.revision = Number.isInteger(value.revision) ? value.revision : 0;
+	value.plan = value.plan.map((node) => ({ ...node, commands: Array.isArray(node.commands) ? node.commands : [] }));
 	value.verificationChecks = Array.isArray(value.verificationChecks) ? value.verificationChecks : [];
 	value.authorities = Array.isArray(value.authorities) ? value.authorities : [];
 	value.constraints = Array.isArray(value.constraints) ? value.constraints : [];
@@ -297,6 +302,7 @@ export function normalizeState(raw: unknown): GoalState | undefined {
 	value.auditReports = Array.isArray(value.auditReports) ? value.auditReports : [];
 	value.repeatedToolCalls = value.repeatedToolCalls ?? {};
 	value.repeatedBlockers = value.repeatedBlockers ?? {};
+	value.recoveryEvidence = Array.isArray(value.recoveryEvidence) ? value.recoveryEvidence : [];
 	value.activeToolCalls = {};
 	value.backgroundWork = value.backgroundWork ?? {};
 	value.continuationSequence = Number.isInteger(value.continuationSequence) ? value.continuationSequence : 0;
@@ -412,6 +418,7 @@ export class GoalStore {
 		this.state.evidence = this.state.evidence.slice(-500);
 		this.state.evaluatorReports = this.state.evaluatorReports.slice(-100);
 		this.state.auditReports = this.state.auditReports.slice(-50);
+		this.state.recoveryEvidence = this.state.recoveryEvidence.slice(-250);
 		const safeSummary = redactText(summary, 300).text;
 		atomicWrite(this.statePath(ctx), `${JSON.stringify(this.state, null, 2)}\n`);
 		atomicWrite(join(this.sessionDir(ctx), "evidence.json"), `${JSON.stringify(this.state.evidence, null, 2)}\n`);

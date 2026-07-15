@@ -32,10 +32,18 @@ export interface GoalCriterion {
 	waiverReason?: string;
 }
 
+export interface CommandInvocation {
+	executable: string;
+	args: string[];
+	cwd?: string;
+	actionClasses?: ActionClass[];
+}
+
 export interface GoalNode {
 	id: string;
 	title: string;
 	description?: string;
+	commands?: CommandInvocation[];
 	status: NodeStatus;
 	dependsOn: string[];
 	criterionIds: string[];
@@ -75,12 +83,21 @@ export interface AuthorityTarget {
 	equals: string | number | boolean | null;
 }
 
+export type CommandTrailingPolicy = "none" | "any" | "workspace_paths" | "single_value";
+
+export interface CommandAuthorityPolicy {
+	executable: string;
+	argsPrefix: string[];
+	trailingArgs: CommandTrailingPolicy;
+}
+
 export interface ActionAuthority {
 	id: string;
 	label: string;
 	actionClass: ActionClass;
 	toolName: string;
 	targets: AuthorityTarget[];
+	command?: CommandAuthorityPolicy;
 	inputHash?: string;
 	maxUses: number;
 	uses: number;
@@ -144,6 +161,27 @@ export interface DeferredRiskAction extends PendingRiskAction {
 	createdAt: string;
 }
 
+export interface PendingAuthorityAmendment {
+	authorities: Omit<ActionAuthority, "uses">[];
+	rationale: string;
+	requestedAt: string;
+	resumePhase: GoalPhase;
+	resumeCurrentAction: string;
+	resumeNextAction: string;
+}
+
+export interface RecoveryEvidence {
+	id: string;
+	kind: "authority_denial" | "check_failure" | "safe_alternative" | "replan";
+	fingerprint: string;
+	summary: string;
+	createdAt: string;
+	toolCallId?: string;
+	toolName?: string;
+	checkId?: string;
+	nodeId?: string;
+}
+
 export interface GoalInterrupt {
 	class: InterruptClass;
 	message: string;
@@ -153,6 +191,7 @@ export interface GoalInterrupt {
 	signature: string;
 	createdAt: string;
 	pendingAction?: PendingRiskAction;
+	pendingAuthorityAmendment?: PendingAuthorityAmendment;
 }
 
 export interface GoalAmendment {
@@ -232,6 +271,7 @@ export interface GoalState {
 	lastProgressMarker?: string;
 	repeatedToolCalls: Record<string, number>;
 	repeatedBlockers: Record<string, number>;
+	recoveryEvidence: RecoveryEvidence[];
 	activeToolCalls: Record<string, { toolName: string; startedAt: string }>;
 	backgroundWork: Record<string, BackgroundWork>;
 	setupAwaitingUser?: boolean;
@@ -244,6 +284,7 @@ export interface GoalDraft {
 		id?: string;
 		title: string;
 		description?: string;
+		commands?: CommandInvocation[];
 		dependsOn?: string[];
 		criterionIds?: string[];
 	}>;
@@ -317,4 +358,11 @@ export interface VerificationResult {
 	aborted?: boolean;
 	signal?: string;
 	durationMs: number;
+	stdout?: string;
+	stderr?: string;
+	stdoutBytes?: number;
+	stderrBytes?: number;
+	stdoutTruncated?: boolean;
+	stderrTruncated?: boolean;
+	outputRedacted?: boolean;
 }

@@ -5,7 +5,7 @@ import { progress } from "./state.ts";
 import type { GoalSetupTranscript, GoalState } from "./types.ts";
 
 export type SetupAction = "approve" | "refine" | "cancel";
-export type DetailAction = "close" | "pause" | "resume" | "cancel" | "approve_risk" | "resolve";
+export type DetailAction = "close" | "pause" | "resume" | "cancel" | "approve_risk" | "approve_amendment" | "resolve";
 
 function plainWrap(text: string, width: number): string[] {
 	const limit = Math.max(8, width);
@@ -78,14 +78,23 @@ export function detailContent(state: GoalState, width: number): string[] {
 	section(lines, "Plan", state.plan.map((node) => `${node.status === "done" ? "✓" : node.status === "in_progress" ? "▶" : node.status === "blocked" ? "!" : "○"} ${node.title}`), width);
 	section(lines, "Recent evidence", state.evidence.length ? state.evidence.slice(-8).map((evidence) => `${evidence.kind}: ${evidence.summary}`) : ["No evidence recorded yet."] , width);
 	if (Object.keys(state.backgroundWork).length) section(lines, "Background work", Object.values(state.backgroundWork).map((item) => `${item.label} (${item.id})`), width);
-	if (state.interrupt) section(lines, `${state.interrupt.class} interruption`, [state.interrupt.message, `Tried: ${state.interrupt.attempts.join("; ") || "none"}`, `Need: ${state.interrupt.need}`, `Recommendation: ${state.interrupt.recommendation}`], width);
+	if (state.interrupt) section(lines, `${state.interrupt.class} interruption`, [
+		state.interrupt.message,
+		`Tried: ${state.interrupt.attempts.join("; ") || "none"}`,
+		`Need: ${state.interrupt.need}`,
+		`Recommendation: ${state.interrupt.recommendation}`,
+		...(state.interrupt.pendingAuthorityAmendment ? state.interrupt.pendingAuthorityAmendment.authorities.map((authority) => `Authority amendment: ${authority.actionClass} ${authority.toolName} ${authority.command ? `${authority.command.executable} ${authority.command.argsPrefix.join(" ")} trailing=${authority.command.trailingArgs}` : "typed target"}`) : []),
+	], width);
 	section(lines, "Controls", [
 		...(state.status === "paused"
 			? ["P resume"]
 			: state.status === "interrupted"
-				? state.interrupt?.pendingAction ? [] : ["P resume without changing the approved contract"]
+				? state.interrupt?.pendingAction || state.interrupt?.pendingAuthorityAmendment ? [] : ["P resume without changing the approved contract"]
 				: ["P pause"]),
-		...(state.interrupt?.pendingAction ? [
+		...(state.interrupt?.pendingAuthorityAmendment ? [
+			"A approve only the displayed typed authority amendment",
+			"R reject or redirect the amendment with a resolution",
+		] : state.interrupt?.pendingAction ? [
 			"A approve only the displayed pending action once (not a general resume)",
 			"R reject or redirect the displayed action with a resolution",
 		] : state.status === "interrupted" ? ["R provide blocker resolution"] : []),
@@ -168,13 +177,14 @@ class DetailPanel extends ScrollPanel {
 	handleAction(data: string): boolean {
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) { this.done("close"); return true; }
 		if (matchesKey(data, "p")) {
-			const canResume = this.state.status === "paused" || (this.state.status === "interrupted" && !this.state.interrupt?.pendingAction);
+			const canResume = this.state.status === "paused" || (this.state.status === "interrupted" && !this.state.interrupt?.pendingAction && !this.state.interrupt?.pendingAuthorityAmendment);
 			const canPause = this.state.status === "running" || this.state.status === "auditing";
 			if (!canResume && !canPause) return false;
 			this.done(canResume ? "resume" : "pause");
 			return true;
 		}
 		if (matchesKey(data, "c")) { this.done("cancel"); return true; }
+		if (matchesKey(data, "a") && this.state.interrupt?.pendingAuthorityAmendment) { this.done("approve_amendment"); return true; }
 		if (matchesKey(data, "a") && this.state.interrupt?.pendingAction) { this.done("approve_risk"); return true; }
 		if (matchesKey(data, "r") && this.state.status === "interrupted") { this.done("resolve"); return true; }
 		return false;

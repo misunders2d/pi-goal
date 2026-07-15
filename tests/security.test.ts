@@ -109,6 +109,28 @@ test("typed structural authority and exact one-call hash permit only approved ac
 	assert.equal(classifyToolCall(goal, "bash", { command: "git push origin other" }).allow, false);
 });
 
+test("typed executable policies compose local, network, and exact Git authority", () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-command-policy-"));
+	try {
+		mkdirSync(join(root, ".venv", "bin"), { recursive: true });
+		const goal = createGoalState({ outcome: "commands", criteria: ["safe"], phases: [{ id: "P1", title: "work" }], verificationChecks: [{ id: "V1", kind: "file_exists", label: "x", path: "x" }], authorities: [], constraints: [], nonGoals: [] }, { cwd: root, sessionManager: { getSessionId: () => "commands" } } as any);
+		goal.status = "running";
+		const authority = (id: string, actionClass: "local_process" | "network_read" | "external_write", executable: string, argsPrefix: string[], trailingArgs: "none" | "any" | "workspace_paths" | "single_value") => ({ id, label: id, actionClass, toolName: "bash", targets: [{ path: "cwd", equals: root }], command: { executable, argsPrefix, trailingArgs }, maxUses: 20, uses: 0 });
+		goal.authorities.push(
+			authority("uv-local", "local_process", "uv", ["run", "pytest"], "any"),
+			authority("uv-network", "network_read", "uv", ["run", "pytest"], "any"),
+			authority("python", "local_process", ".venv/bin/python", ["-m", "pytest"], "any"),
+			authority("pytest", "local_process", ".venv/bin/pytest", [], "any"),
+			authority("git-add", "local_process", "git", ["add", "--"], "workspace_paths"),
+			authority("git-commit", "local_process", "git", ["commit", "-m"], "single_value"),
+			authority("git-push-local", "local_process", "git", ["push", "origin", "feature/safe"], "none"),
+			authority("git-push-external", "external_write", "git", ["push", "origin", "feature/safe"], "none"),
+		);
+		for (const command of ["uv run pytest -q tests/unit", ".venv/bin/python -m pytest -q tests/unit", ".venv/bin/pytest -q tests/unit", "git add -- src/a.py", "git commit -m safe-message", "git push origin feature/safe"]) assert.equal(classifyToolCall(goal, "bash", { command }).allow, true, command);
+		for (const command of ["uv sync", "git add .", "git add -A", "git reset --hard", "git clean -fd", "git checkout -- .", "git rebase main", "git push --force origin feature/safe", "git push origin other", "rm -rf src", "npm publish"]) assert.equal(classifyToolCall(goal, "bash", { command }).allow, false, command);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("unknown custom mutation fails closed while provable reads pass", () => {
 	const goal = state();
 	const mutation = classifyToolCall(goal, "records_create", {}, { name: "records_create", description: "Create a record" } as any);

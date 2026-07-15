@@ -58,6 +58,14 @@ test("detail content surfaces interruption controls and resumes only non-RISK bl
 	assert.doesNotMatch(riskText, /P resume without changing/);
 	assert.doesNotMatch(riskText, /P pause/);
 
+	const amendment = state();
+	amendment.status = "interrupted";
+	amendment.interrupt = { class: "RISK", message: "Add runner", attempts: [], need: "Approval", recommendation: "Review", signature: "a", createdAt: new Date().toISOString(), pendingAuthorityAmendment: { authorities: [{ id: "A1", label: "pytest", actionClass: "local_process", toolName: "bash", targets: [{ path: "cwd", equals: amendment.cwd }], command: { executable: ".venv/bin/pytest", argsPrefix: [], trailingArgs: "any" }, maxUses: 10 }], rationale: "omitted runner", requestedAt: new Date().toISOString(), resumePhase: "executing", resumeCurrentAction: "Implement", resumeNextAction: "Test" } };
+	const amendmentText = detailContent(amendment, 80).join("\n");
+	assert.match(amendmentText, /Authority amendment: local_process bash \.venv\/bin\/pytest/);
+	assert.match(amendmentText, /A approve only the displayed typed authority amendment/);
+	assert.doesNotMatch(amendmentText, /P resume without changing/);
+
 	const blocker = state();
 	blocker.status = "interrupted";
 	blocker.interrupt = { class: "BLOCKER", message: "Retry needed", attempts: ["Recovered"], need: "Retry", recommendation: "Resume", signature: "b", createdAt: new Date().toISOString() };

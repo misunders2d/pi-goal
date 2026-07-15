@@ -88,6 +88,10 @@ function goalArtifact(root: string, name: "state.json" | "events.jsonl" | "evide
 	return join(root, "agent", "pi-goal", "sessions", sessionKey, name);
 }
 
+function commandAuthority(id: string, cwd: string, actionClass: "local_process" | "network_read" | "external_write", executable: string, argsPrefix: string[], trailingArgs: "none" | "any" | "workspace_paths" | "single_value" = "any") {
+	return { id, label: `${actionClass} ${executable} ${argsPrefix.join(" ")}`, actionClass, toolName: "bash", targets: [{ path: "cwd", equals: cwd }], command: { executable, argsPrefix, trailingArgs }, maxUses: 20 };
+}
+
 test("registers only canonical /goal and rejects noninteractive starts", async () => {
 	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
 	try {
@@ -927,31 +931,26 @@ test("pause, steering, resume, and cancellation invalidate queued work", async (
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("BLOCKER opens on the third durable identical encounter", async () => {
+test("three distinct evidenced denials plus replan permit BLOCKER interruption", async () => {
 	const root = mkdtempSync(join(tmpdir(), "pi-goal-blocker-"));
 	try {
 		const harness = makeHarness(root);
+		mkdirSync(harness.ctx.cwd, { recursive: true });
 		const state = injectRunning(harness);
 		await harness.emit("session_start", { type: "session_start", reason: "resume" });
-		const request = {
-			goalId: state.goalId,
-			generation: state.generation,
-			class: "BLOCKER",
-			message: "Immutable approved check cannot execute",
-			attempts: ["Validated the same deterministic contract defect"],
-			need: "A new valid contract",
-			recommendation: "Cancel and recreate after fixing setup validation",
-		};
-		await assert.rejects(() => harness.tool("pi_goal_request_interrupt", request), /requires three repeated/);
-		await assert.rejects(() => harness.tool("pi_goal_request_interrupt", request), /requires three repeated/);
+		for (const [index, command] of ["uv run pytest -q tests/unit", ".venv/bin/python -m pytest -q tests/unit", ".venv/bin/pytest -q tests/unit"].entries()) {
+			const denied = (await harness.emit("tool_call", { type: "tool_call", toolName: "bash", toolCallId: `deny-${index}`, input: { command } })).find(Boolean);
+			assert.equal(denied.block, true);
+		}
+		const request = { goalId: state.goalId, generation: state.generation, class: "BLOCKER", message: "Typed runner authority is missing", attempts: ["Three exact runners denied"], need: "Narrow authority amendment", recommendation: "Amend exact executable policies" };
+		await assert.rejects(() => harness.tool("pi_goal_request_interrupt", request), /need one successful replan/);
+		await harness.tool("pi_goal_update_plan", { goalId: state.goalId, generation: state.generation, reason: "Separate authority recovery from implementation", nodes: [{ id: "P1", title: "Implement", status: "in_progress", criterionIds: ["AC1"] }] });
 		const opened = await harness.tool("pi_goal_request_interrupt", request);
 		assert.match(opened.content[0].text, /BLOCKER interruption opened/);
 		const persisted = latestState(harness);
 		assert.equal(persisted.status, "interrupted");
-		assert.equal(persisted.phase, "blocked");
-		assert.equal(persisted.interrupt.class, "BLOCKER");
-		const events = readFileSync(goalArtifact(root, "events.jsonl"), "utf8");
-		assert.equal((events.match(/blocker_encounter/g) ?? []).length, 2);
+		assert.equal(new Set(persisted.recoveryEvidence.filter((item: any) => item.kind === "authority_denial").map((item: any) => item.fingerprint)).size, 3);
+		assert.equal(persisted.recoveryEvidence.some((item: any) => item.kind === "replan"), true);
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -1002,5 +1001,93 @@ test("background event completion, reload, and manual compaction queue fresh con
 		harness.messages.length = 0;
 		await harness.emit("session_compact", { type: "session_compact", willRetry: true });
 		assert.equal(harness.messages.length, 0);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("contract rejects cwd-only bash and accepts composed uv authority", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-command-contract-"));
+	try {
+		const harness = makeHarness(root);
+		mkdirSync(harness.ctx.cwd, { recursive: true });
+		await harness.command("goal", "Run focused tests");
+		const setup = latestState(harness);
+		const contract = {
+			...draft,
+			phases: [{ id: "P1", title: "Test", criterionIds: ["AC1"], commands: [{ executable: "uv", args: ["run", "pytest", "-q", "tests/unit"], cwd: harness.ctx.cwd }] }],
+			verificationChecks: [{ id: "V1", kind: "command_exit", label: "focused", executable: "uv", args: ["run", "pytest", "-q", "tests/unit"], cwd: harness.ctx.cwd }],
+			authorities: [{ id: "A1", label: "cwd only", actionClass: "local_process", toolName: "bash", targets: [{ path: "cwd", equals: harness.ctx.cwd }], maxUses: 10 }],
+		};
+		await assert.rejects(() => harness.tool("pi_goal_submit_contract", { goalId: setup.goalId, generation: setup.generation, ...contract }), /bash authority requires a typed command policy|missing typed/);
+		contract.authorities = [
+			commandAuthority("A-local", harness.ctx.cwd, "local_process", "uv", ["run", "pytest"]),
+			commandAuthority("A-network", harness.ctx.cwd, "network_read", "uv", ["run", "pytest"]),
+		] as any;
+		await harness.tool("pi_goal_submit_contract", { goalId: setup.goalId, generation: setup.generation, ...contract });
+		assert.equal(latestState(harness).status, "awaiting_approval");
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("human-approved authority amendment preserves active goal state and resumes same step", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-authority-amend-"));
+	try {
+		const harness = makeHarness(root);
+		mkdirSync(harness.ctx.cwd, { recursive: true });
+		const state = injectRunning(harness);
+		state.currentAction = "Keep this step";
+		state.nextAction = "Run focused pytest";
+		state.evidence.push({ id: "e1", kind: "tool_result", summary: "valuable evidence", criterionIds: ["AC1"], paths: [], createdAt: new Date().toISOString() });
+		const originalPlan = structuredClone(state.plan);
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		await harness.tool("pi_goal_request_authority_amendment", { goalId: state.goalId, generation: state.generation, rationale: "Add omitted venv pytest runner", authorities: [commandAuthority("A-pytest", harness.ctx.cwd, "local_process", ".venv/bin/pytest", [])] });
+		assert.equal(latestState(harness).status, "interrupted");
+		assert.ok(latestState(harness).interrupt.pendingAuthorityAmendment);
+		await harness.emit("input", { type: "input", source: "interactive", text: "approve exact authority amendment" });
+		const resumed = latestState(harness);
+		assert.equal(resumed.goalId, state.goalId);
+		assert.equal(resumed.status, "running");
+		assert.equal(resumed.currentAction, "Keep this step");
+		assert.deepEqual(resumed.plan, originalPlan);
+		assert.equal(resumed.evidence.some((item: any) => item.id === "e1"), true);
+		assert.equal(resumed.authorities.some((item: any) => item.id === "A-pytest"), true);
+		const allowed = (await harness.emit("tool_call", { type: "tool_call", toolName: "bash", toolCallId: "pytest", input: { command: ".venv/bin/pytest -q tests/unit" } })).find(Boolean);
+		assert.equal(allowed, undefined);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("failed approved checks return bounded redacted stdout and stderr diagnostics", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-check-diagnostics-"));
+	try {
+		const harness = makeHarness(root);
+		mkdirSync(harness.ctx.cwd, { recursive: true });
+		const state = injectRunning(harness);
+		const secret = "npm_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
+		state.verificationChecks = [{ id: "V1", kind: "command_exit", label: "diagnostic", executable: "node", args: ["-e", `process.stdout.write('${secret}'+ 'x'.repeat(9000)); process.stderr.write('stderr detail'); process.exit(4)`], cwd: harness.ctx.cwd }];
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		await assert.rejects(() => harness.tool("pi_goal_run_check", { goalId: state.goalId, generation: state.generation, checkId: "V1" }), (error: any) => {
+			assert.match(error.message, /check V1 failed/i);
+			assert.match(error.message, /exitCode=4/);
+			assert.match(error.message, /stderr detail/);
+			assert.match(error.message, /stdoutTruncated=true/);
+			assert.match(error.message, /\[REDACTED\]/);
+			assert.doesNotMatch(error.message, new RegExp(secret));
+			return true;
+		});
+		assert.equal(latestState(harness).recoveryEvidence.some((item: any) => item.kind === "check_failure" && item.checkId === "V1"), true);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("failed approved check counts as a safe RISK alternative", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-risk-check-alternative-"));
+	try {
+		const harness = makeHarness(root);
+		mkdirSync(harness.ctx.cwd, { recursive: true });
+		const state = injectRunning(harness);
+		state.verificationChecks = [{ id: "V1", kind: "command_exit", label: "fails safely", executable: "node", args: ["-e", "process.exit(2)"], cwd: harness.ctx.cwd }];
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		const denied = (await harness.emit("tool_call", { type: "tool_call", toolName: "records_create", toolCallId: "risk", input: { name: "external" } })).find(Boolean);
+		assert.equal(denied.block, true);
+		await assert.rejects(() => harness.tool("pi_goal_run_check", { goalId: state.goalId, generation: state.generation, checkId: "V1" }), /check V1 failed/i);
+		const opened = await harness.tool("pi_goal_request_interrupt", { goalId: state.goalId, generation: state.generation, class: "RISK", message: "External action required", attempts: ["Approved check failed safely"], need: "Exact action", recommendation: "Approve once" });
+		assert.match(opened.content[0].text, /RISK interruption opened/);
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });

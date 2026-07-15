@@ -1,5 +1,6 @@
 import { isAbsolute, relative, resolve } from "node:path";
 import type { ToolInfo } from "@earendil-works/pi-coding-agent";
+import { hardCommandDenyReason, matchingCommandAuthorities, parseSimpleCommand } from "./authority.ts";
 import { canonicalJson, inputHash, isSensitivePath, resolvedPathWithinWorkspace } from "./state.ts";
 import type { ActionAuthority, ActionClass, GoalState } from "./types.ts";
 
@@ -8,6 +9,7 @@ export interface SafetyDecision {
 	reason?: string;
 	actionClass?: ActionClass;
 	authorityId?: string;
+	authorityIds?: string[];
 	recoverable?: boolean;
 }
 
@@ -246,13 +248,23 @@ export function classifyToolCall(
 	if (toolName === "write" || toolName === "edit") return { allow: true, actionClass: "workspace_write" };
 	if (["read", "grep", "find", "ls"].includes(toolName)) return { allow: true, actionClass: "workspace_read" };
 	if (toolName === "bash") {
-		const command = typeof input.command === "string" ? input.command : "";
-		const risk = commandRisk(command, state.cwd, agentDir);
+		const commandText = typeof input.command === "string" ? input.command : "";
+		const parsed = parseSimpleCommand(commandText, state.cwd);
+		if (parsed.command) {
+			const hardDeny = hardCommandDenyReason(parsed.command);
+			if (hardDeny) return { allow: false, reason: hardDeny, actionClass: "destructive" };
+			const commandMatch = matchingCommandAuthorities(state, parsed.command);
+			if (commandMatch.authorities) return { allow: true, actionClass: commandMatch.authorities.at(-1)?.actionClass ?? "local_process", authorityIds: commandMatch.authorities.map((authority) => authority.id) };
+			const risk = commandRisk(commandText, state.cwd, agentDir);
+			if (!risk.risky) return { allow: true, actionClass: "local_process" };
+			if (risk.recoverable) return { allow: false, reason: risk.reason, actionClass: "local_process", recoverable: true };
+			const exactAuthority = matchingAuthority(state, toolName, input);
+			if (exactAuthority?.inputHash && !exactAuthority.command) return { allow: true, actionClass: exactAuthority.actionClass, authorityId: exactAuthority.id };
+			return { allow: false, reason: `missing typed ${commandMatch.missing.join(" + ")} authority for executable ${JSON.stringify(parsed.command.executable)} in ${JSON.stringify(state.cwd)}`, actionClass: commandMatch.missing.includes("external_write") ? "external_write" : "local_process" };
+		}
+		const risk = commandRisk(commandText, state.cwd, agentDir);
 		if (!risk.risky) return { allow: true, actionClass: "local_process" };
-		if (risk.recoverable) return { allow: false, reason: risk.reason, actionClass: "local_process", recoverable: true };
-		const authority = matchingAuthority(state, toolName, input);
-		if (authority) return { allow: true, actionClass: authority.actionClass, authorityId: authority.id };
-		return { allow: false, reason: risk.reason, actionClass: "destructive" };
+		return { allow: false, reason: parsed.error ?? risk.reason, actionClass: "local_process", recoverable: risk.recoverable };
 	}
 
 	const combined = `${toolName} ${info?.description ?? ""}`;

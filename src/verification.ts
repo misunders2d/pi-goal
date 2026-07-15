@@ -24,7 +24,7 @@ function runProcess(
 	cwd: string,
 	timeoutMs: number,
 	signal?: AbortSignal,
-): Promise<{ exitCode: number; durationMs: number; stdout: string; timedOut: boolean; aborted: boolean; signal?: string }> {
+): Promise<{ exitCode: number; durationMs: number; stdout: string; stderr: string; stdoutBytes: number; stderrBytes: number; stdoutTruncated: boolean; stderrTruncated: boolean; timedOut: boolean; aborted: boolean; signal?: string }> {
 	return new Promise((resolvePromise, reject) => {
 		const started = Date.now();
 		let settled = false;
@@ -37,19 +37,32 @@ function runProcess(
 			stdio: ["ignore", "pipe", "pipe"],
 			env: safeEnvironment(),
 		});
-		let bytes = 0;
+		const captureLimit = 8_192;
 		let stdout = "";
+		let stderr = "";
+		let stdoutBytes = 0;
+		let stderrBytes = 0;
+		let stdoutTruncated = false;
+		let stderrTruncated = false;
 		const terminate = () => {
 			child.kill("SIGTERM");
 			forceKill = setTimeout(() => child.kill("SIGKILL"), 1_000);
 		};
-		const consume = (chunk: Buffer, capture: boolean) => {
-			bytes += chunk.length;
-			if (capture && stdout.length < 1_000_000) stdout += chunk.toString("utf8").slice(0, 1_000_000 - stdout.length);
-			if (bytes > 2_000_000) terminate();
+		const consume = (chunk: Buffer, stream: "stdout" | "stderr") => {
+			const text = chunk.toString("utf8");
+			if (stream === "stdout") {
+				stdoutBytes += chunk.length;
+				if (stdout.length < captureLimit) stdout += text.slice(0, captureLimit - stdout.length);
+				if (stdoutBytes > captureLimit) stdoutTruncated = true;
+			} else {
+				stderrBytes += chunk.length;
+				if (stderr.length < captureLimit) stderr += text.slice(0, captureLimit - stderr.length);
+				if (stderrBytes > captureLimit) stderrTruncated = true;
+			}
+			if (stdoutBytes + stderrBytes > 262_144) terminate();
 		};
-		child.stdout?.on("data", (chunk: Buffer) => consume(chunk, true));
-		child.stderr?.on("data", (chunk: Buffer) => consume(chunk, false));
+		child.stdout?.on("data", (chunk: Buffer) => consume(chunk, "stdout"));
+		child.stderr?.on("data", (chunk: Buffer) => consume(chunk, "stderr"));
 		const timer = setTimeout(() => { timedOut = true; terminate(); }, timeoutMs);
 		const abort = () => { aborted = true; terminate(); };
 		signal?.addEventListener("abort", abort, { once: true });
@@ -68,7 +81,7 @@ function runProcess(
 			if (settled) return;
 			settled = true;
 			cleanup();
-			resolvePromise({ exitCode: typeof code === "number" ? code : 128, durationMs: Date.now() - started, stdout, timedOut, aborted, signal: closeSignal ?? undefined });
+			resolvePromise({ exitCode: typeof code === "number" ? code : 128, durationMs: Date.now() - started, stdout, stderr, stdoutBytes, stderrBytes, stdoutTruncated, stderrTruncated, timedOut, aborted, signal: closeSignal ?? undefined });
 		});
 	});
 }
@@ -164,7 +177,20 @@ export async function runVerificationCheck(check: VerificationCheck, workspace: 
 						: result.signal
 							? `command terminated by ${result.signal}`
 							: passed ? `command exited ${expected}` : `command exited ${result.exitCode}; expected ${expected}`;
-				return { checkId: check.id, passed, summary, exitCode: result.exitCode, timedOut: result.timedOut || undefined, aborted: result.aborted || undefined, signal: result.signal, durationMs: result.durationMs };
+				const safeStdout = redactText(result.stdout, 8_192);
+				const safeStderr = redactText(result.stderr, 8_192);
+				return {
+					checkId: check.id, passed, summary, exitCode: result.exitCode,
+					timedOut: result.timedOut || undefined, aborted: result.aborted || undefined,
+					signal: result.signal, durationMs: result.durationMs,
+					...(!passed ? {
+						stdout: safeStdout.text, stderr: safeStderr.text,
+						stdoutBytes: result.stdoutBytes, stderrBytes: result.stderrBytes,
+						stdoutTruncated: result.stdoutTruncated || safeStdout.redacted || undefined,
+						stderrTruncated: result.stderrTruncated || safeStderr.redacted || undefined,
+						outputRedacted: safeStdout.redacted || safeStderr.redacted || undefined,
+					} : {}),
+				};
 			}
 			case "git_status": {
 				const result = await runProcess("git", ["status", "--porcelain"], workspace, 30_000, signal);

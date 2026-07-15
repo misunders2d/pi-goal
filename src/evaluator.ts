@@ -158,12 +158,17 @@ function normalizeAuthority(value: unknown, index: number): Omit<ActionAuthority
 			return typeof pair.path === "string" && (pair.equals === null || ["string", "number", "boolean"].includes(typeof pair.equals));
 		})
 		: [];
+	const rawCommand = item.command && typeof item.command === "object" ? item.command as Record<string, unknown> : undefined;
+	const command = rawCommand && typeof rawCommand.executable === "string" && Array.isArray(rawCommand.argsPrefix) && rawCommand.argsPrefix.every((arg) => typeof arg === "string") && ["none", "any", "workspace_paths", "single_value"].includes(String(rawCommand.trailingArgs))
+		? { executable: rawCommand.executable, argsPrefix: rawCommand.argsPrefix as string[], trailingArgs: rawCommand.trailingArgs as NonNullable<ActionAuthority["command"]>["trailingArgs"] }
+		: undefined;
 	return {
 		id: typeof item.id === "string" ? item.id : `A${index + 1}`,
 		label: typeof item.label === "string" ? item.label : `${item.actionClass}: ${item.toolName}`,
 		actionClass: item.actionClass as ActionAuthority["actionClass"],
 		toolName: item.toolName,
 		targets,
+		command,
 		inputHash: typeof item.inputHash === "string" ? item.inputHash : undefined,
 		maxUses: typeof item.maxUses === "number" ? Math.max(1, Math.min(100, Math.floor(item.maxUses))) : 1,
 		expiresAt: typeof item.expiresAt === "string" ? item.expiresAt : undefined,
@@ -193,10 +198,18 @@ export function normalizeDraft(value: unknown, originalOutcome: string, workspac
 		if (!entry || typeof entry !== "object") return [];
 		const phase = entry as Record<string, unknown>;
 		if (typeof phase.title !== "string" || !phase.title.trim()) return [];
+		const actionClasses = new Set(["workspace_read", "workspace_write", "local_process", "network_read", "external_write", "publication", "destructive"]);
+		const commands = Array.isArray(phase.commands) ? phase.commands.flatMap((raw) => {
+			if (!raw || typeof raw !== "object") return [];
+			const command = raw as Record<string, unknown>;
+			if (typeof command.executable !== "string" || !Array.isArray(command.args) || !command.args.every((arg) => typeof arg === "string")) return [];
+			return [{ executable: command.executable, args: command.args as string[], cwd: typeof command.cwd === "string" ? command.cwd : undefined, actionClasses: Array.isArray(command.actionClasses) ? command.actionClasses.filter((value): value is ActionAuthority["actionClass"] => typeof value === "string" && actionClasses.has(value)) : undefined }];
+		}) : [];
 		return [{
 			id: typeof phase.id === "string" ? phase.id : `P${index + 1}`,
 			title: phase.title.trim(),
 			description: typeof phase.description === "string" ? phase.description : undefined,
+			commands,
 			dependsOn: Array.isArray(phase.dependsOn) ? phase.dependsOn.filter((id): id is string => typeof id === "string") : undefined,
 			criterionIds: Array.isArray(phase.criterionIds) ? phase.criterionIds.filter((id): id is string => typeof id === "string") : undefined,
 		}];
