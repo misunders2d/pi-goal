@@ -96,6 +96,22 @@ test("only bounded local commands pass while scripts, outside writes, remote git
 	}
 });
 
+test("quote-aware command parsing preserves literal argv and rejects live shell syntax", () => {
+	const cwd = "/tmp";
+	const script = "const x=1;process.exit(0)";
+	assert.deepEqual(parseSimpleCommand(`node -e "${script}"`, cwd).command, { executable: "node", args: ["-e", script], cwd });
+	assert.deepEqual(parseSimpleCommand(`node -e 'if (true && true) { process.exit(0); }'`, cwd).command?.args, ["-e", "if (true && true) { process.exit(0); }"]);
+	assert.deepEqual(parseSimpleCommand("printf '%s' '$(date) ${HOME} $HOME `date`;&&|<>*?{}~'", cwd).command?.args, ["%s", "$(date) ${HOME} $HOME `date`;&&|<>*?{}~"]);
+	assert.deepEqual(parseSimpleCommand("echo \\; \\$HOME \\*", cwd).command?.args, [";", "$HOME", "*"]);
+	assert.deepEqual(parseSimpleCommand('printf "" "a\\\\;b"', cwd).command?.args, ["", "a\\;b"]);
+	for (const command of [
+		"echo a && echo b", "echo a || echo b", "echo a; echo b", "echo a | cat", "echo > out", "echo < in",
+		"echo `date`", "echo $(date)", "echo ${HOME}", "echo $HOME", "echo *", "echo ?", "echo [ab]", "echo {a,b}", "echo ~", "echo #comment", "echo &",
+		'node -e "console.log($(date))"', 'node -e "console.log(${HOME})"', 'node -e "console.log($HOME)"', 'node -e "`date`"',
+		'node -e "unterminated', "node -e 'unterminated", "echo \\", "echo a\u0000b", "echo 'a\u0000b'", "VAR=value node --version",
+	]) assert.equal(parseSimpleCommand(command, cwd).command, undefined, command);
+});
+
 test("typed structural authority and exact one-call hash permit only approved action", () => {
 	const goal = state();
 	goal.authorities.push({ id: "A1", label: "write one row", actionClass: "external_write", toolName: "sheet_write", targets: [{ path: "spreadsheet", equals: "abc" }], maxUses: 1, uses: 0 });
@@ -160,8 +176,15 @@ test("approved secondary roots allow exact file and typed command scope without 
 		assert.equal(classifyToolCall(goal, "write", { path: join(outside, "no.txt"), content: "no" }).allow, false);
 		symlinkSync(secondary, join(primary, "linked"));
 		assert.equal(classifyToolCall(goal, "read", { path: "linked/ok.txt" }).allow, false);
-		goal.authorities.push({ id: "A-secondary", label: "secondary node", actionClass: "local_process", toolName: "bash", targets: [{ path: "cwd", equals: secondary }], command: { executable: "node", argsPrefix: ["--version"], trailingArgs: "none" }, maxUses: 1, uses: 0 });
+		const script = "const fs=require('fs');const ok=true;process.exit(ok?0:1)";
+		goal.authorities.push(
+			{ id: "A-secondary", label: "secondary node", actionClass: "local_process", toolName: "bash", targets: [{ path: "cwd", equals: secondary }], command: { executable: "node", argsPrefix: ["--version"], trailingArgs: "none" }, maxUses: 1, uses: 0 },
+			{ id: "A-secondary-script", label: "secondary quoted script", actionClass: "local_process", toolName: "bash", targets: [{ path: "cwd", equals: secondary }], command: { executable: "node", argsPrefix: ["-e", script], trailingArgs: "none" }, maxUses: 1, uses: 0 },
+		);
 		assert.equal(classifyToolCall(goal, "bash", { command: `cd ${secondary} && node --version` }).allow, true);
+		assert.equal(classifyToolCall(goal, "bash", { command: `cd ${secondary} && node -e "${script}"` }).allow, true);
+		assert.equal(classifyToolCall(goal, "bash", { command: `cd ${secondary} && node -e "${script.replace("ok=true", "ok=false")}"` }).allow, false);
+		assert.equal(classifyToolCall(goal, "bash", { command: `cd ${secondary} && node -e "if (true && true) { process.exit(0); }"` }).allow, false, "quoted && must not become a top-level separator or bypass exact argv authority");
 		assert.equal(classifyToolCall(goal, "bash", { command: `cd ${secondary} && ls | head` }).allow, false, "secondary-root fallback syntax must not bypass typed executable authority");
 		assert.equal(classifyToolCall(goal, "bash", { command: `cd ${outside} && node --version` }).allow, false);
 		assert.equal(classifyToolCall(goal, "bash", { command: `cd ${secondary} && node --version && echo extra` }).allow, false);

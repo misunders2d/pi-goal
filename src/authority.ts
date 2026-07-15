@@ -8,46 +8,92 @@ export interface ParsedCommand {
 	cwd: string;
 }
 
-function tokenize(command: string): string[] | undefined {
+const SHELL_CONSTRUCTION_ERROR = "shell construction, expansion, pipes, redirects, or multiple commands are not allowed by typed executable authority";
+
+interface ScannedCommand {
+	tokens?: string[];
+	andAndPositions: number[];
+	error?: string;
+}
+
+function scanCommand(command: string): ScannedCommand {
 	const tokens: string[] = [];
+	const andAndPositions: number[] = [];
 	let current = "";
+	let tokenStarted = false;
 	let quote: "'" | '"' | undefined;
-	let escaped = false;
-	for (const character of command.trim()) {
-		if (escaped) { current += character; escaped = false; continue; }
-		if (character === "\\" && quote !== "'") { escaped = true; continue; }
-		if (quote) {
-			if (character === quote) quote = undefined;
+	const pushToken = () => {
+		if (tokenStarted) tokens.push(current);
+		current = "";
+		tokenStarted = false;
+	};
+	for (let index = 0; index < command.length; index += 1) {
+		const character = command[index]!;
+		if (character === "\u0000" || character === "\n" || character === "\r") return { andAndPositions, error: SHELL_CONSTRUCTION_ERROR };
+		if (quote === "'") {
+			if (character === "'") quote = undefined;
 			else current += character;
+			tokenStarted = true;
 			continue;
 		}
-		if (character === "'" || character === '"') { quote = character; continue; }
-		if (/\s/.test(character)) {
-			if (current) { tokens.push(current); current = ""; }
+		if (quote === '"') {
+			if (character === '"') { quote = undefined; tokenStarted = true; continue; }
+			if (character === "\\") {
+				const next = command[index + 1];
+				if (next === undefined || next === "\n" || next === "\r") return { andAndPositions, error: "command quoting could not be parsed safely" };
+				tokenStarted = true;
+				if (["$", "`", '"', "\\"].includes(next)) { current += next; index += 1; }
+				else current += "\\";
+				continue;
+			}
+			if (character === "$" || character === "`") return { andAndPositions, error: SHELL_CONSTRUCTION_ERROR };
+			current += character;
+			tokenStarted = true;
 			continue;
 		}
+		if (character === "\\") {
+			const next = command[index + 1];
+			if (next === undefined || next === "\n" || next === "\r") return { andAndPositions, error: "command quoting could not be parsed safely" };
+			current += next;
+			tokenStarted = true;
+			index += 1;
+			continue;
+		}
+		if (character === "'" || character === '"') { quote = character; tokenStarted = true; continue; }
+		if (/\s/.test(character)) { pushToken(); continue; }
+		if (character === "&" && command[index + 1] === "&") {
+			pushToken();
+			andAndPositions.push(index);
+			index += 1;
+			continue;
+		}
+		if (/[&|;<>`$*?{}~\[\]()#]/.test(character)) return { andAndPositions, error: SHELL_CONSTRUCTION_ERROR };
 		current += character;
+		tokenStarted = true;
 	}
-	if (quote || escaped) return undefined;
-	if (current) tokens.push(current);
-	return tokens;
+	if (quote) return { andAndPositions, error: "command quoting could not be parsed safely" };
+	pushToken();
+	return { tokens, andAndPositions };
 }
 
 export function parseSimpleCommand(command: string, cwd: string, workspaceRoots: string[] = [cwd]): { command?: ParsedCommand; error?: string } {
 	if (!command.trim()) return { error: "empty command" };
-	const separators = command.match(/&&/g)?.length ?? 0;
-	if (separators === 1) {
-		const [left, right] = command.split(/&&/, 2);
-		const cd = tokenize(left ?? "");
-		if (cd?.length === 2 && cd[0] === "cd" && isAbsolutePath(cd[1]!)) {
+	const scanned = scanCommand(command);
+	if (scanned.error) return { error: scanned.error };
+	if (scanned.andAndPositions.length === 1) {
+		const separator = scanned.andAndPositions[0]!;
+		const left = scanCommand(command.slice(0, separator));
+		const right = command.slice(separator + 2);
+		const cd = left.tokens;
+		if (!left.error && cd?.length === 2 && cd[0] === "cd" && isAbsolutePath(cd[1]!)) {
 			const target = workspaceRootForCwd(cwd, workspaceRoots, cd[1]!);
 			if (!target) return { error: "cd target must exactly equal an approved workspace root" };
-			return parseSimpleCommand(right ?? "", target, workspaceRoots);
+			return parseSimpleCommand(right, target, workspaceRoots);
 		}
 		return { error: "only exact cd <approved-root> && <simple-command> is allowed" };
 	}
-	if (/(?:&&|\|\||[;|<>`\n\r]|\$\(|\$\{|[*?{}~])/.test(command)) return { error: "shell construction, expansion, pipes, redirects, or multiple commands are not allowed by typed executable authority" };
-	const tokens = tokenize(command);
+	if (scanned.andAndPositions.length > 1) return { error: SHELL_CONSTRUCTION_ERROR };
+	const tokens = scanned.tokens;
 	if (!tokens?.length) return { error: "command quoting could not be parsed safely" };
 	if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0]!)) return { error: "environment assignment prefixes are not executable authority" };
 	const executable = tokens[0]!;
@@ -148,7 +194,7 @@ export function validateCommandAuthorityDefinition(authority: Omit<ActionAuthori
 	if (!commandCwd) errors.push("bash authority requires exactly one cwd target equal to an approved workspace root");
 	const policy = authority.command;
 	if (!policy) return errors;
-	if (!policy.executable || /[\s;&|<>`$\n\r]/.test(policy.executable)) errors.push("command executable is invalid");
+	if (!policy.executable || /[\u0000\s;&|<>`$\n\r]/.test(policy.executable)) errors.push("command executable is invalid");
 	if (policy.executable.includes("/") && commandCwd && !resolvedPathWithinWorkspaces(commandCwd, workspaceRoots, policy.executable)) errors.push("command executable path leaves the approved workspace");
 	if (!Array.isArray(policy.argsPrefix) || policy.argsPrefix.some((arg) => typeof arg !== "string" || /[\u0000\n\r]/.test(arg))) errors.push("command argsPrefix is invalid");
 	if (!["none", "any", "workspace_paths", "single_value"].includes(policy.trailingArgs)) errors.push("command trailingArgs policy is invalid");

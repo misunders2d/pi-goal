@@ -20,19 +20,19 @@ Goal mode never weakens Pi's existing permission or confirmation gates. Workspac
 ## Install
 
 ```bash
-pi install npm:@misunders2d/pi-goal@1.0.16
+pi install npm:@misunders2d/pi-goal@1.0.17
 ```
 
 Try without installing:
 
 ```bash
-pi -e npm:@misunders2d/pi-goal@1.0.16
+pi -e npm:@misunders2d/pi-goal@1.0.17
 ```
 
 Pinned GitHub release:
 
 ```bash
-pi install git:github.com/misunders2d/pi-goal@v1.0.16
+pi install git:github.com/misunders2d/pi-goal@v1.0.17
 ```
 
 ## Use
@@ -70,7 +70,7 @@ This package is an interactive TUI product. Print (`-p`), JSON, and RPC modes ca
 - The final auditor runs in an isolated in-memory Pi session with no extensions, skills, prompt templates, context files, worker transcript, or tools; it receives immutable constrained-verifier results.
 - Verification commands are approved during setup and can be executed by check ID during normal work or completion preflight without a shell; final adjudication reuses the authoritative preflight results.
 - Filesystem boundaries use canonical resolved paths, reject symlink traversal outside the selected approved root, and recheck sensitive resolved targets. Additional roots must exist, be directories, use canonical non-symlink paths, and be explicitly setup-approved.
-- Worker shell execution uses a bounded autonomous command allowlist. Typed command authority matches an exact executable, argument prefix, trailing policy, action-class composition, and cwd; it never means arbitrary Bash inside a directory.
+- Worker shell execution uses a bounded autonomous command allowlist. Typed command authority matches an exact executable, quote-aware literal argument vector, trailing policy, action-class composition, and cwd; quoted or escaped punctuation remains literal while live shell operators, expansion, substitution, redirects, globbing, comments, environment prefixes, and malformed quoting fail closed. It never means arbitrary Bash inside a directory.
 - Safe Git mutation is limited to exact-path `add`, one-message `commit`, and push to the declared remote and branch. Reset, clean, restore, checkout, rebase, broad staging, force push, and arbitrary remotes remain blocked.
 - Isolated evaluation and audit calls have bounded deadlines with abort propagation; verification timeouts are reported explicitly.
 - Setup rejects development-only npm checks against production packages beneath `node_modules`; installed-artifact checks must use shipped files or dependency-free runtime checks.
@@ -92,6 +92,8 @@ npm install --ignore-scripts
 npm run check
 npm pack --dry-run
 ```
+
+Installed-artifact release validation must use fresh synthetic roots and a self-contained harness against only the packed or installed artifact plus its runtime dependencies. It must not import prior synthetic suites, repository-only fixtures, or development-only tests from another checkout.
 
 The npm package is discoverable by [pi.dev/packages](https://pi.dev/packages) through the `pi-package` keyword and explicit `pi.extensions` manifest.
 
