@@ -43,16 +43,25 @@ test("panel layout fits narrow terminals and avoids unnecessary wide scrolling",
 	assert.equal(tiny.viewport + 1 + 2, tiny.maxBoxRows);
 });
 
-test("detail content surfaces interruption attempts, need, and recommendation", () => {
-	const goal = state();
-	goal.status = "interrupted";
-	goal.interrupt = { class: "RISK", message: "External write needed", attempts: ["Tried local path"], need: "Approval", recommendation: "Approve once", signature: "x", createdAt: new Date().toISOString(), pendingAction: { toolName: "publish", inputHash: "hash", label: "Publish once" } };
-	const text = detailContent(goal, 80).join("\n");
-	assert.match(text, /RISK interruption/);
-	assert.match(text, /Tried:/);
-	assert.match(text, /Need:/);
-	assert.match(text, /Recommendation:/);
-	assert.match(text, /A approve only the displayed pending action once/);
-	assert.match(text, /not a general resume/);
-	assert.match(text, /R reject or redirect/);
+test("detail content surfaces interruption controls and resumes only non-RISK blockers", () => {
+	const risk = state();
+	risk.status = "interrupted";
+	risk.interrupt = { class: "RISK", message: "External write needed", attempts: ["Tried local path"], need: "Approval", recommendation: "Approve once", signature: "x", createdAt: new Date().toISOString(), pendingAction: { toolName: "publish", inputHash: "hash", label: "Publish once" } };
+	const riskText = detailContent(risk, 80).join("\n");
+	assert.match(riskText, /RISK interruption/);
+	assert.match(riskText, /Tried:/);
+	assert.match(riskText, /Need:/);
+	assert.match(riskText, /Recommendation:/);
+	assert.match(riskText, /A approve only the displayed pending action once/);
+	assert.match(riskText, /not a general resume/);
+	assert.match(riskText, /R reject or redirect/);
+	assert.doesNotMatch(riskText, /P resume without changing/);
+	assert.doesNotMatch(riskText, /P pause/);
+
+	const blocker = state();
+	blocker.status = "interrupted";
+	blocker.interrupt = { class: "BLOCKER", message: "Retry needed", attempts: ["Recovered"], need: "Retry", recommendation: "Resume", signature: "b", createdAt: new Date().toISOString() };
+	const blockerText = detailContent(blocker, 80).join("\n");
+	assert.match(blockerText, /P resume without changing the approved contract/);
+	assert.match(blockerText, /R provide blocker resolution/);
 });

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { IsolatedModelRunner, normalizeAuditDecision, normalizeDraft, withDeadline } from "../src/evaluator.ts";
-import piGoalExtension, { isExplicitGoalSteeringInput, isInformationalGoalInput, validateAuditCompletion, verificationRecoveryWindow } from "../src/index.ts";
+import piGoalExtension, { isExplicitGoalSteeringInput, isInformationalGoalInput, isLegacyAutomaticDoomLoopInterrupt, validateAuditCompletion, verificationRecoveryWindow } from "../src/index.ts";
 import { SETUP_TRANSCRIPT_CUSTOM_TYPE, STATE_CUSTOM_TYPE, createGoalState, sha256 } from "../src/state.ts";
 import type { GoalDraft } from "../src/types.ts";
 
@@ -749,7 +749,7 @@ test("declared background tool without a job identity fails closed", async () =>
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("third identical call triggers autonomous recovery guard", async () => {
+test("third identical unresolved call triggers autonomous recovery without user interruption", async () => {
 	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
 	try {
 		const harness = makeHarness(root);
@@ -758,11 +758,146 @@ test("third identical call triggers autonomous recovery guard", async () => {
 		const event = { type: "tool_call", toolName: "read", toolCallId: "r", input: { path: "README.md" } };
 		assert.equal((await harness.emit("tool_call", event)).find(Boolean), undefined);
 		assert.equal((await harness.emit("tool_call", { ...event, toolCallId: "r2" })).find(Boolean), undefined);
-		for (let attempt = 3; attempt <= 5; attempt += 1) {
+		for (let attempt = 3; attempt <= 8; attempt += 1) {
 			const blocked = (await harness.emit("tool_call", { ...event, toolCallId: `r${attempt}` })).find(Boolean);
 			assert.equal(blocked.block, true);
-			assert.match(blocked.reason, /Repeated identical call/);
+			assert.match(blocked.reason, /does not require user attention/);
 		}
+		assert.equal(latestState(harness).status, "running");
+		assert.equal(latestState(harness).interrupt, undefined);
+		assert.equal(Object.values(latestState(harness).repeatedToolCalls)[0], 3);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("successful identical async result reads reset duplicate-call tracking", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-async-repeat-"));
+	try {
+		const harness = makeHarness(root);
+		const state = injectRunning(harness);
+		state.authorities.push({ id: "A-result", label: "inspect helper results", actionClass: "workspace_read", toolName: "subagent_result", targets: [], maxUses: 20, uses: 0 });
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		for (let attempt = 1; attempt <= 8; attempt += 1) {
+			const input = { job_id: "job-1" };
+			const toolCallId = `result-${attempt}`;
+			assert.equal((await harness.emit("tool_call", { type: "tool_call", toolName: "subagent_result", toolCallId, input })).find(Boolean), undefined);
+			await harness.emit("tool_result", { type: "tool_result", toolName: "subagent_result", toolCallId, input, isError: false, content: [], details: { state: "running" } });
+		}
+		assert.deepEqual(latestState(harness).repeatedToolCalls, {});
+		assert.equal(latestState(harness).interrupt, undefined);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("failed identical calls still accumulate until autonomous recovery", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-failed-repeat-"));
+	try {
+		const harness = makeHarness(root);
+		injectRunning(harness);
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		const input = { path: "README.md" };
+		for (let attempt = 1; attempt <= 2; attempt += 1) {
+			const toolCallId = `failed-${attempt}`;
+			assert.equal((await harness.emit("tool_call", { type: "tool_call", toolName: "read", toolCallId, input })).find(Boolean), undefined);
+			await harness.emit("tool_result", { type: "tool_result", toolName: "read", toolCallId, input, isError: true, content: [], details: {} });
+		}
+		const blocked = (await harness.emit("tool_call", { type: "tool_call", toolName: "read", toolCallId: "failed-3", input })).find(Boolean);
+		assert.equal(blocked.block, true);
+		assert.equal(latestState(harness).interrupt, undefined);
+		const editInput = { path: "src/fix.ts", oldText: "a", newText: "b" };
+		await harness.emit("tool_call", { type: "tool_call", toolName: "edit", toolCallId: "repair", input: editInput });
+		await harness.emit("tool_result", { type: "tool_result", toolName: "edit", toolCallId: "repair", input: editInput, isError: false, content: [], details: {} });
+		assert.equal((await harness.emit("tool_call", { type: "tool_call", toolName: "read", toolCallId: "after-repair", input })).find(Boolean), undefined);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("worker can run immutable setup-approved checks without ad-hoc shell authority", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-approved-check-"));
+	try {
+		const harness = makeHarness(root);
+		mkdirSync(harness.ctx.cwd, { recursive: true });
+		const state = injectRunning(harness);
+		state.verificationChecks = [
+			{ id: "V1", kind: "command_exit", label: "node exits cleanly", executable: "node", args: ["-e", "process.exit(0)"], cwd: harness.ctx.cwd, expectedExitCode: 0 },
+			{ id: "V2", kind: "command_exit", label: "node failure remains failure", executable: "node", args: ["-e", "process.exit(2)"], cwd: harness.ctx.cwd, expectedExitCode: 0 },
+			{ id: "V3", kind: "command_exit", label: "detect concurrent goal change", executable: "node", args: ["-e", "setTimeout(() => process.exit(0), 100)"], cwd: harness.ctx.cwd, expectedExitCode: 0 },
+		];
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		const adHoc = (await harness.emit("tool_call", { type: "tool_call", toolName: "bash", toolCallId: "shell-check", input: { command: "node -e process.exit(0)" } })).find(Boolean);
+		assert.equal(adHoc.block, true);
+		const result = await harness.tool("pi_goal_run_check", { goalId: state.goalId, generation: state.generation, checkId: "V1" });
+		assert.equal(JSON.parse(result.content[0].text).passed, true);
+		await assert.rejects(() => harness.tool("pi_goal_run_check", { goalId: state.goalId, generation: state.generation, checkId: "V2" }), /Approved check V2 failed/);
+		await assert.rejects(() => harness.tool("pi_goal_run_check", { goalId: state.goalId, generation: state.generation, checkId: "missing" }), /Unknown approved verification check/);
+		const changing = harness.tool("pi_goal_run_check", { goalId: state.goalId, generation: state.generation, checkId: "V3" });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		await harness.emit("input", { type: "input", source: "interactive", text: "Also include concurrent-state validation" });
+		await assert.rejects(() => changing, /Stale goal ID or generation|Goal changed while approved check was running/);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("non-RISK interruption reply resolves and resumes without becoming goal steering", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-interrupt-resolution-"));
+	try {
+		const harness = makeHarness(root);
+		const state = injectRunning(harness);
+		state.status = "interrupted";
+		state.phase = "blocked";
+		state.interrupt = { class: "BLOCKER", message: "Need direction", attempts: ["Tried recovery"], need: "Direction", recommendation: "Reply with direction", signature: "blocker", createdAt: new Date().toISOString() };
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		const beforeGeneration = state.generation;
+		await harness.emit("input", { type: "input", source: "interactive", text: "okay, approved" });
+		const resumed = latestState(harness);
+		assert.equal(resumed.status, "running");
+		assert.equal(resumed.interrupt, undefined);
+		assert.equal(resumed.generation, beforeGeneration + 1);
+		assert.ok(resumed.outcome.amendments.at(-1).consumedAt);
+		assert.match(JSON.stringify(harness.messages.at(-1)), /interruption resolution/);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("bare /goal can resume a non-RISK interruption without changing authority or contract", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-interrupt-resume-"));
+	try {
+		const harness = makeHarness(root);
+		const state = injectRunning(harness);
+		state.status = "interrupted";
+		state.phase = "blocked";
+		state.interrupt = { class: "BLOCKER", message: "Retry with existing evidence", attempts: ["Recovered once"], need: "Retry", recommendation: "Resume", signature: "blocker", createdAt: new Date().toISOString() };
+		const generation = state.generation;
+		const authorityCount = state.authorities.length;
+		harness.ctx.ui.custom = async () => "resume";
+		await harness.command("goal", "");
+		const resumed = latestState(harness);
+		assert.equal(resumed.status, "running");
+		assert.equal(resumed.interrupt, undefined);
+		assert.equal(resumed.generation, generation);
+		assert.equal(resumed.authorities.length, authorityCount);
+		assert.match(JSON.stringify(harness.messages.at(-1)), /Resume from durable state/);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("session reload repairs only exact legacy automatic doom-loop interruptions", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-legacy-doom-"));
+	try {
+		const harness = makeHarness(root);
+		const state = injectRunning(harness);
+		const interruptedAt = new Date(Date.now() - 1_000).toISOString();
+		state.status = "interrupted";
+		state.phase = "blocked";
+		state.interrupt = { class: "BLOCKER", message: "The same tool call repeated without new evidence.", attempts: ["subagent_result repeated 6 times"], need: "A materially different approach.", recommendation: "Inspect evidence and replan rather than repeating the call.", signature: sha256("BLOCKER\nThe same tool call repeated without new evidence.\nA materially different approach."), createdAt: interruptedAt };
+		state.outcome.amendments.push({ id: "reply", text: "okay, approved", createdAt: new Date().toISOString() });
+		await harness.emit("session_start", { type: "session_start", reason: "reload" });
+		const recovered = latestState(harness);
+		assert.equal(recovered.status, "running");
+		assert.equal(recovered.interrupt, undefined);
+		assert.deepEqual(recovered.repeatedToolCalls, {});
+		assert.ok(recovered.outcome.amendments.at(-1).consumedAt);
+		assert.match(JSON.stringify(harness.messages.at(-1)), /obsolete duplicate-call interruption/);
+
+		const nearMiss = structuredClone(recovered);
+		nearMiss.status = "interrupted";
+		nearMiss.phase = "blocked";
+		nearMiss.interrupt = { class: "BLOCKER", message: "Human blocker", attempts: ["subagent_result repeated 6 times"], need: "A materially different approach.", recommendation: "Inspect evidence and replan rather than repeating the call.", signature: "human", createdAt: new Date().toISOString() };
+		assert.equal(isLegacyAutomaticDoomLoopInterrupt(nearMiss), false);
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -831,6 +966,9 @@ test("pending RISK requires exact phrase and consumes matching authority before 
 		await harness.emit("tool_call", { type: "tool_call", toolName: "read", toolCallId: "risk-read", input: { path: "README.md" } });
 		await harness.emit("tool_result", { type: "tool_result", toolName: "read", toolCallId: "risk-read", input: { path: "README.md" }, isError: false, content: [], details: {} });
 		await harness.tool("pi_goal_request_interrupt", { goalId: initial.goalId, generation: initial.generation, class: "RISK", message: "External creation is necessary", attempts: ["Inspected local alternative"], need: "Exact creation approval", recommendation: "Approve once" });
+		await harness.emit("input", { type: "input", source: "interactive", text: "resume goal" });
+		assert.equal(latestState(harness).status, "interrupted");
+		assert.match(harness.notifications.at(-1).message, /Exact pending RISK/);
 		await harness.emit("input", { type: "input", source: "interactive", text: "approve it" });
 		assert.equal(latestState(harness).authorities.length, 0);
 		assert.match(harness.notifications.at(-1).message, /Exact approval required/);

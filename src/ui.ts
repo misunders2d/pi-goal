@@ -80,7 +80,11 @@ export function detailContent(state: GoalState, width: number): string[] {
 	if (Object.keys(state.backgroundWork).length) section(lines, "Background work", Object.values(state.backgroundWork).map((item) => `${item.label} (${item.id})`), width);
 	if (state.interrupt) section(lines, `${state.interrupt.class} interruption`, [state.interrupt.message, `Tried: ${state.interrupt.attempts.join("; ") || "none"}`, `Need: ${state.interrupt.need}`, `Recommendation: ${state.interrupt.recommendation}`], width);
 	section(lines, "Controls", [
-		state.status === "paused" ? "P resume" : "P pause",
+		...(state.status === "paused"
+			? ["P resume"]
+			: state.status === "interrupted"
+				? state.interrupt?.pendingAction ? [] : ["P resume without changing the approved contract"]
+				: ["P pause"]),
 		...(state.interrupt?.pendingAction ? [
 			"A approve only the displayed pending action once (not a general resume)",
 			"R reject or redirect the displayed action with a resolution",
@@ -163,7 +167,13 @@ class DetailPanel extends ScrollPanel {
 	title(): string { return "Goal control"; }
 	handleAction(data: string): boolean {
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) { this.done("close"); return true; }
-		if (matchesKey(data, "p")) { this.done(this.state.status === "paused" ? "resume" : "pause"); return true; }
+		if (matchesKey(data, "p")) {
+			const canResume = this.state.status === "paused" || (this.state.status === "interrupted" && !this.state.interrupt?.pendingAction);
+			const canPause = this.state.status === "running" || this.state.status === "auditing";
+			if (!canResume && !canPause) return false;
+			this.done(canResume ? "resume" : "pause");
+			return true;
+		}
 		if (matchesKey(data, "c")) { this.done("cancel"); return true; }
 		if (matchesKey(data, "a") && this.state.interrupt?.pendingAction) { this.done("approve_risk"); return true; }
 		if (matchesKey(data, "r") && this.state.status === "interrupted") { this.done("resolve"); return true; }

@@ -20,19 +20,19 @@ Goal mode never weakens Pi's existing permission or confirmation gates. Workspac
 ## Install
 
 ```bash
-pi install npm:@misunders2d/pi-goal@1.0.11
+pi install npm:@misunders2d/pi-goal@1.0.12
 ```
 
 Try without installing:
 
 ```bash
-pi -e npm:@misunders2d/pi-goal@1.0.11
+pi -e npm:@misunders2d/pi-goal@1.0.12
 ```
 
 Pinned GitHub release:
 
 ```bash
-pi install git:github.com/misunders2d/pi-goal@v1.0.11
+pi install git:github.com/misunders2d/pi-goal@v1.0.12
 ```
 
 ## Use
@@ -51,7 +51,7 @@ Then:
 
 `/goal <outcome>` activates setup mode in the current conversation. The same main agent sees the normal session history, resolves references from prior discussion, debates conflicts, and asks only materially necessary follow-up questions. Clarification has no artificial round limit. Before approval, operational tools are hard-blocked; the agent may only discuss the goal, inspect sanitized goal status, or submit a complete typed contract. Questions and answers remain visible in the ordinary conversation transcript. Once clear, the agent submits observable done conditions, ordered phases, mechanical verification checks, constraints, non-goals, and all foreseeable scoped authorities needed for fire-and-forget completion. Run bare `/goal` to review the contract, refine it back in the same conversation, cancel it, or approve once. Bare `/goal` otherwise opens progress and controls.
 
-Natural-language directions steer an active goal, while informational questions—including audit-time status questions—do not mutate the contract or generation. Explicit audit-time steering atomically cancels the stale audit and returns the goal to planning. The overlay provides pause, resume, cancel, blocker resolution, and exact unavoidable-risk approval. Contract submission validates every proposed verification check with the same structural rules used at runtime, so deterministic contract defects are rejected before approval. Completion preflight failures remain in execution; `recovering` is reserved for unexpected runtime divergence and bounded no-progress loops. Multi-criterion steps require criterion-specific evidence and remain active until every mapped criterion is covered. Approved failures expose sanitized targets immediately; an identical runtime failure opens `BLOCKER`, and runtime verification recovery is capped at ten minutes. A recoverable optional tool-shape denial is recorded and blocked without changing the lifecycle phase; a safe typed fallback can continue ordinary execution. Accepted evidence also reconciles stale non-verification recovery state from older sessions. A genuine RISK requires an exact blocked action plus evidence of a safe alternative attempt. In the overlay, `A` approves only that displayed action once, while `R` rejects or redirects it. In normal input, approve a displayed pending action only with `approve exact pending risk once`; broader approval wording does not grant authority.
+Natural-language directions steer an active goal, while informational questions—including audit-time status questions—do not mutate the contract or generation. Explicit audit-time steering atomically cancels the stale audit and returns the goal to planning. The overlay provides pause, resume, cancel, blocker resolution, and exact unavoidable-risk approval. Non-RISK interruptions can resume without changing the approved contract; RISK remains limited to the displayed exact action. Contract submission validates every proposed verification check with the same structural rules used at runtime, so deterministic contract defects are rejected before approval. Completion preflight failures remain in execution; `recovering` is reserved for unexpected runtime divergence and bounded no-progress loops. Multi-criterion steps require criterion-specific evidence and remain active until every mapped criterion is covered. Approved failures expose sanitized targets immediately; an identical runtime failure opens `BLOCKER`, and runtime verification recovery is capped at ten minutes. A recoverable optional tool-shape denial is recorded and blocked without changing the lifecycle phase; a safe typed fallback can continue ordinary execution. Accepted evidence also reconciles stale non-verification recovery state from older sessions. A genuine RISK requires an exact blocked action plus evidence of a safe alternative attempt. In the overlay, `A` approves only that displayed action once, while `R` rejects or redirects it. In normal input, approve a displayed pending action only with `approve exact pending risk once`; broader approval wording does not grant authority.
 
 ## Deliberate boundary
 
@@ -66,7 +66,7 @@ This package is an interactive TUI product. Print (`-p`), JSON, and RPC modes ca
 - Durable evidence stores metadata, hashes, statuses, and sanitized summaries—not raw tool output, environment values, credentials, tokens, private keys, or auth-file contents.
 - Setup discussion remains in the normal session transcript; durable setup state stores the original outcome and lifecycle metadata, not a second hidden Q&A transcript.
 - The final auditor runs in an isolated in-memory Pi session with no extensions, skills, prompt templates, context files, worker transcript, or mutation tools.
-- Verification commands are approved during setup and executed later by check ID without a shell.
+- Verification commands are approved during setup and can be executed by check ID during normal work, completion preflight, and final audit without a shell.
 - Filesystem boundaries use resolved paths, reject symlink traversal outside goal cwd, and recheck sensitive resolved targets.
 - Worker shell execution uses a bounded autonomous command allowlist; arbitrary runtimes and package scripts require exact authority or approved verification.
 - Isolated evaluation and audit calls have bounded deadlines with abort propagation; verification timeouts are reported explicitly.

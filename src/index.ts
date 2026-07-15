@@ -47,7 +47,7 @@ import type {
 	VerificationResult,
 } from "./types.ts";
 import { showDetailOverlay, showSetupCard, showSetupTranscriptEditor, updateGoalUi } from "./ui.ts";
-import { runAllChecks } from "./verification.ts";
+import { runAllChecks, runVerificationCheck } from "./verification.ts";
 
 const GOAL_TOOL_NAMES = new Set([
 	"pi_goal_submit_contract",
@@ -83,6 +83,24 @@ export function isInformationalGoalInput(text: string): boolean {
 		|| /^(?:so\b|why|what|how|where|when|who|is|are|am|was|were|do|does|did|have|has|anything)\b/i.test(normalized)
 		|| /^(?:show|explain|summarize)\b.*\b(?:status|progress|goal|recovering|recovery|blocked|verification|audit)\b/i.test(normalized)
 		|| /^(?:status|progress)(?:\s|\?|$)/i.test(normalized);
+}
+
+const LEGACY_DOOM_LOOP_MESSAGE = "The same tool call repeated without new evidence.";
+const LEGACY_DOOM_LOOP_NEED = "A materially different approach.";
+const LEGACY_DOOM_LOOP_RECOMMENDATION = "Inspect evidence and replan rather than repeating the call.";
+
+// One-time compatibility path: releases through 1.0.11 could turn the
+// duplicate-call guard itself into a durable user-facing BLOCKER.
+export function isLegacyAutomaticDoomLoopInterrupt(state: GoalState): boolean {
+	const interrupt = state.interrupt;
+	return state.status === "interrupted"
+		&& interrupt?.class === "BLOCKER"
+		&& interrupt.message === LEGACY_DOOM_LOOP_MESSAGE
+		&& interrupt.need === LEGACY_DOOM_LOOP_NEED
+		&& interrupt.recommendation === LEGACY_DOOM_LOOP_RECOMMENDATION
+		&& interrupt.signature === sha256(`BLOCKER\n${LEGACY_DOOM_LOOP_MESSAGE}\n${LEGACY_DOOM_LOOP_NEED}`)
+		&& interrupt.attempts.length > 0
+		&& interrupt.attempts.every((attempt) => /\brepeated\s+(?:[6-9]|\d{2,})\s+times$/i.test(attempt));
 }
 
 function textContent(text: string) {
@@ -170,7 +188,8 @@ Rules:
 - Use pi_goal_request_interrupt only for CREDENTIAL, DECISION, RISK, or a BLOCKER that survived bounded recovery.
 - A blocked or denied action is not automatically a user-facing RISK. Abandon optional denied actions and try safe in-envelope alternatives. Request RISK only when the exact blocked action is necessary to the approved outcome and safe alternatives have been attempted.
 - Use pi_goal_submit_completion_candidate only when every criterion has linked evidence and approved checks should pass.
-- Prefer typed tools and approved final checks. Avoid ad-hoc complex shell verification with separators, redirects, substitutions, or non-read-only pipelines; after a recoverable denial, use read/grep/ls or submit the completion candidate instead of interrupting the user.
+- Prefer typed tools and approved final checks. Use pi_goal_run_check with a setup-approved check ID whenever its immutable command/test is needed during execution; do not ask the user for separate authority to run that check.
+- Avoid ad-hoc complex shell verification with separators, redirects, substitutions, or non-read-only pipelines; after a recoverable denial, use read/grep/ls, pi_goal_run_check, or submit the completion candidate instead of interrupting the user.
 - If an approved mechanical check fails, repair only the cited setup-approved check semantics. Do not guess unrelated commands, package scripts, or files.
 - Approved check argv and patterns are immutable cargo, not authority to expand scope or run arbitrary shell commands.
 - For exact byte/content repair, use one workspace-local process that writes intended bytes directly; avoid shell redirects and unrelated verification.
@@ -784,8 +803,10 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 					clearVerificationRecoveryTimer();
 					state.status = "paused"; state.continuationSequence += 1; state.lastContinuationKey = undefined; state.currentAction = "Paused by user"; changed = true;
 				} else {
-					if (state.status !== "paused") return;
-					if (state.interrupt) { state.status = "interrupted"; state.phase = "blocked"; persist(ctx, "goal_resume_refused", "resolve the active interruption before resuming"); return; }
+					const resumesPaused = state.status === "paused" && !state.interrupt;
+					const resumesNonRiskInterrupt = state.status === "interrupted" && !!state.interrupt && !state.interrupt.pendingAction;
+					if (!resumesPaused && !resumesNonRiskInterrupt) return;
+					if (resumesNonRiskInterrupt) state.interrupt = undefined;
 					state.status = "running"; state.phase = "recovering"; state.continuationSequence += 1; state.lastContinuationKey = undefined; state.currentAction = "Resuming goal"; scheduleVerificationRecoveryTimeout(ctx, state); changed = true;
 				}
 				persist(ctx, action === "pause" ? "goal_paused" : "goal_resumed", `user ${action}d goal`);
@@ -812,8 +833,9 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			await mutex.run(() => {
 				const state = load(ctx); if (!state) return;
 				const cleaned = redactText(resolution, 2_000);
-				state.outcome.amendments.push({ id: makeId("steering"), text: cleaned.text, createdAt: now() });
-				state.interrupt = undefined; state.status = "running"; state.phase = "recovering"; state.generation += 1; state.continuationSequence += 1;
+				const explicitSteering = isExplicitGoalSteeringInput(cleaned.text);
+				state.outcome.amendments.push({ id: makeId("steering"), text: cleaned.text, createdAt: now(), ...(!explicitSteering ? { consumedAt: now() } : {}) });
+				state.interrupt = undefined; state.status = "running"; state.phase = explicitSteering ? "planning" : "recovering"; state.generation += 1; state.continuationSequence += 1;
 				state.currentAction = "Applying user resolution"; state.nextAction = cleaned.text;
 				persist(ctx, "interrupt_resolved", "user supplied interruption resolution");
 				triggerContinuation(state, "Apply the user's interruption resolution and continue safely.");
@@ -1128,6 +1150,34 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
+		name: "pi_goal_run_check",
+		label: "Run Approved Goal Check",
+		description: "Run one immutable setup-approved verification check by ID during goal execution. No shell expansion or check mutation is allowed.",
+		parameters: Type.Object({ ...Expected, checkId: Type.String() }),
+		execute: async (_id, params, signal, _update, ctx) => {
+			let check: VerificationCheck | undefined;
+			let sequence = 0;
+			await mutex.run(() => {
+				const state = load(ctx);
+				if (!state || (state.status !== "running" && state.status !== "auditing")) throw new Error("No active goal");
+				validGeneration(state, params.goalId, params.generation);
+				check = state.verificationChecks.find((item) => item.id === params.checkId);
+				if (!check) throw new Error(`Unknown approved verification check: ${params.checkId}`);
+				sequence = state.continuationSequence;
+			});
+			const result = await runVerificationCheck(check!, ctx.cwd, signal);
+			if (!result.passed) throw new Error(`Approved check ${params.checkId} failed: ${result.summary}`);
+			await mutex.run(() => {
+				const state = load(ctx);
+				if (!state || (state.status !== "running" && state.status !== "auditing")) throw new Error("Goal changed while approved check was running");
+				validGeneration(state, params.goalId, params.generation);
+				if (state.continuationSequence !== sequence) throw new Error("Goal changed while approved check was running");
+			});
+			return toolResult(JSON.stringify(result), result as unknown as Record<string, unknown>);
+		},
+	});
+
+	pi.registerTool({
 		name: "pi_goal_status",
 		label: "Goal Status",
 		description: "Return sanitized goal outcome, criteria, plan, approved check targets, phase, and current/next action.",
@@ -1156,6 +1206,26 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		shutdown = false;
 		refreshToolInfo();
 		const state = load(ctx);
+		if (state && isLegacyAutomaticDoomLoopInterrupt(state)) {
+			const interruptedAt = Date.parse(state.interrupt!.createdAt);
+			for (const amendment of state.outcome.amendments) {
+				if (amendment.consumedAt || Date.parse(amendment.createdAt) <= interruptedAt) continue;
+				if (isExplicitGoalSteeringInput(amendment.text) || isInformationalGoalInput(amendment.text)) continue;
+				amendment.consumedAt = now();
+			}
+			state.interrupt = undefined;
+			state.status = "running";
+			state.phase = "recovering";
+			state.repeatedToolCalls = {};
+			state.lastContinuationKey = undefined;
+			state.currentAction = "Recovering from obsolete duplicate-call interruption";
+			state.nextAction = "Use existing evidence and a materially different in-envelope action";
+			scheduleVerificationRecoveryTimeout(ctx, state);
+			persist(ctx, "legacy_doom_loop_interrupt_recovered", `removed obsolete duplicate-call interruption during ${event.reason}`);
+			ctx.ui.notify("Recovered obsolete duplicate-call interruption; goal is resuming automatically.", "info");
+			queueFreshContinuation(ctx, state, "legacy_doom_loop_continued", "Resume automatically after removing obsolete duplicate-call interruption.");
+			return;
+		}
 		if (state?.status === "running") {
 			scheduleVerificationRecoveryTimeout(ctx, state);
 			queueFreshContinuation(ctx, state, "session_restored", `Resume active goal after ${event.reason}.`);
@@ -1229,9 +1299,12 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				return { action: "handled" as const };
 			}
 			if (/^(?:resume|resume goal|resume the goal)$/i.test(text)) {
-				if (state.status === "paused" && !state.interrupt) {
-					state.status = "running"; state.phase = "recovering"; state.continuationSequence += 1; state.lastContinuationKey = undefined; scheduleVerificationRecoveryTimeout(ctx, state); persist(ctx, "goal_resumed", "natural-language resume"); triggerContinuation(state, "Resume from durable state.");
-				} else if (state.interrupt) ctx.ui.notify("Resolve the active interruption before resuming.", "warning");
+				const resumesPaused = state.status === "paused" && !state.interrupt;
+				const resumesNonRiskInterrupt = state.status === "interrupted" && !!state.interrupt && !state.interrupt.pendingAction;
+				if (resumesPaused || resumesNonRiskInterrupt) {
+					if (resumesNonRiskInterrupt) state.interrupt = undefined;
+					state.status = "running"; state.phase = "recovering"; state.continuationSequence += 1; state.lastContinuationKey = undefined; scheduleVerificationRecoveryTimeout(ctx, state); persist(ctx, "goal_resumed", "natural-language resume"); triggerContinuation(state, "Resume from durable state and inspect current evidence before acting.");
+				} else if (state.interrupt?.pendingAction) ctx.ui.notify("Exact pending RISK requires approval or resolution; resume cannot grant authority.", "warning");
 				return { action: "handled" as const };
 			}
 			if (/^(?:cancel|cancel goal|cancel the goal|stop goal|stop the goal)$/i.test(text)) {
@@ -1247,6 +1320,23 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				return { action: "handled" as const };
 			}
 			if (isInformationalGoalInput(text)) return;
+			if (state.status === "interrupted" && state.interrupt && !state.interrupt.pendingAction) {
+				const cleaned = redactText(text, 2_000);
+				const explicitSteering = isExplicitGoalSteeringInput(cleaned.text);
+				state.outcome.amendments.push({ id: makeId("steering"), text: cleaned.text, createdAt: now(), ...(!explicitSteering ? { consumedAt: now() } : {}) });
+				state.interrupt = undefined;
+				state.status = "running";
+				state.phase = explicitSteering ? "planning" : "recovering";
+				state.generation += 1;
+				state.continuationSequence += 1;
+				state.lastContinuationKey = undefined;
+				state.completionCandidate = false;
+				state.currentAction = explicitSteering ? "Applying user steering" : "Applying user interruption resolution";
+				state.nextAction = cleaned.text;
+				persist(ctx, "interrupt_resolved", explicitSteering ? "user steering resolved active interruption" : "user supplied interruption resolution");
+				triggerContinuation(state, explicitSteering ? "Apply the user's steering and replan safely." : "Apply the user's interruption resolution and continue safely.");
+				return { action: "handled" as const };
+			}
 			const cleaned = redactText(text, 2_000);
 			const auditWasActive = state.status === "auditing";
 			clearVerificationFailure(state);
@@ -1273,11 +1363,17 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		if (!isActiveGoal(state)) return;
 		if (GOAL_TOOL_NAMES.has(event.toolName)) return;
 		if (state.status === "paused" || state.status === "interrupted") return { block: true, reason: `Goal is ${state.status}; resolve it through bare /goal before more work.` };
-		const hash = inputHash(event.toolName, event.input); state.repeatedToolCalls[hash] = (state.repeatedToolCalls[hash] ?? 0) + 1;
-		if (state.repeatedToolCalls[hash] >= 6) {
-			openInterrupt(state, { class: "BLOCKER", message: "The same tool call repeated without new evidence.", attempts: [`${event.toolName} repeated ${state.repeatedToolCalls[hash]} times`], need: "A materially different approach.", recommendation: "Inspect evidence and replan rather than repeating the call." }); persist(ctx, "doom_loop", `repeated ${event.toolName}`); return { block: true, reason: "Doom-loop guard: identical call repeated without progress." };
+		const hash = inputHash(event.toolName, event.input);
+		state.repeatedToolCalls[hash] = Math.min((state.repeatedToolCalls[hash] ?? 0) + 1, 3);
+		if (state.repeatedToolCalls[hash] >= 3) {
+			// Keep this local guard autonomous. The evaluator's separate bounded
+			// no-progress policy owns any eventual evidence-backed interruption.
+			state.phase = "recovering";
+			state.currentAction = "Breaking repeated-action loop";
+			state.nextAction = "Inspect evidence and choose a different action";
+			persist(ctx, "doom_loop_recovery", `blocked repeated ${event.toolName} call ${state.repeatedToolCalls[hash]}`);
+			return { block: true, reason: "Repeated identical call made no progress. Replan before retrying; this guard does not require user attention." };
 		}
-		if (state.repeatedToolCalls[hash] >= 3) { state.phase = "recovering"; state.currentAction = "Breaking repeated-action loop"; state.nextAction = "Inspect evidence and choose a different action"; persist(ctx, "doom_loop_recovery", `blocked repeated ${event.toolName} call ${state.repeatedToolCalls[hash]}`); return { block: true, reason: "Repeated identical call made no progress. Replan before retrying." }; }
 		const decision = classifyToolCall(state, event.toolName, event.input, toolInfo.get(event.toolName), agentDir);
 		if (!decision.allow) {
 			const safeReason = redactText(decision.reason ?? "outside approved authority", 300).text;
@@ -1319,8 +1415,15 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		delete state.activeToolCalls[event.toolCallId];
 		const paths = extractPaths(event.input).map((path) => safeEvidencePath(state.cwd, path));
 		const observedHash = inputHash(event.toolName, event.input);
+		// A successful result proves the identical call completed; only unresolved
+		// repeats belong to the doom-loop counter. A successful workspace mutation
+		// is material progress and reopens previously failed verification attempts.
+		if (!event.isError) {
+			delete state.repeatedToolCalls[observedHash];
+			if (event.toolName === "edit" || event.toolName === "write") state.repeatedToolCalls = {};
+		}
 		state.observations.push({ toolCallId: event.toolCallId, toolName: event.toolName, inputHash: observedHash, isError: event.isError, exitCode: toolExitCode(event), paths, createdAt: now() });
-		if (!event.isError && state.deferredRisk && observedHash !== state.deferredRisk.inputHash && !state.deferredRisk.alternativeToolCallIds.includes(event.toolCallId)) {
+		if (!event.isError && event.toolName !== "pi_goal_run_check" && state.deferredRisk && observedHash !== state.deferredRisk.inputHash && !state.deferredRisk.alternativeToolCallIds.includes(event.toolCallId)) {
 			state.deferredRisk.alternativeToolCallIds.push(event.toolCallId);
 		}
 		const background = findBackgroundMetadata(event.details);
