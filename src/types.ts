@@ -213,6 +213,27 @@ export interface EvaluatorReport {
 
 export type AuditGapCode = "missing_criterion_result" | "criterion_unmet" | "missing_evidence" | "criterion_missing" | "audit_rejected";
 
+export type AuditExecutionCode =
+	| "AUDIT_TIMEOUT"
+	| "AUDIT_ABORTED"
+	| "AUDIT_EMPTY_OUTPUT"
+	| "AUDIT_MALFORMED_OUTPUT"
+	| "AUDIT_SCHEMA_ERROR"
+	| "AUDIT_TOOL_ERROR"
+	| "AUDIT_MODEL_ERROR";
+
+export interface AuditExecutionDiagnostic {
+	code: AuditExecutionCode;
+	stage: "session" | "prompt" | "tool" | "output" | "parse" | "schema";
+	message: string;
+	elapsedMs: number;
+	attemptCount: number;
+	retryable: boolean;
+	suggestedAction: string;
+	fingerprint: string;
+	createdAt: string;
+}
+
 export interface AuditFailureGap {
 	criterionId: string;
 	criterionText: string;
@@ -253,6 +274,7 @@ export interface GoalState {
 	goalId: string;
 	sessionId: string;
 	cwd: string;
+	workspaceRoots: string[];
 	status: GoalStatus;
 	phase: GoalPhase;
 	generation: number;
@@ -290,6 +312,9 @@ export interface GoalState {
 	lastRejectedAuditInputFingerprint?: string;
 	lastAuditRejectionFingerprint?: string;
 	auditRejectionRepeatCount: number;
+	auditExecution?: AuditExecutionDiagnostic;
+	lastAuditExecutionInputFingerprint?: string;
+	auditExecutionRepeatCount: number;
 	verificationFailureSignature?: string;
 	verificationFailureCount: number;
 	verificationRecoveryStartedAt?: string;
@@ -305,6 +330,7 @@ export interface GoalState {
 
 export interface GoalDraft {
 	outcome: string;
+	workspaceRoots?: string[];
 	criteria: string[];
 	phases: Array<{
 		id?: string;

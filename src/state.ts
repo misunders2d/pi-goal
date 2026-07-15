@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -77,11 +77,49 @@ export function isSensitivePath(path: string): boolean {
 	return /(^|[/\\])(?:\.env(?:\.|$)|auth\.json$|credentials?(?:\.|$)|secrets?(?:\.|$)|id_(?:rsa|ed25519)$|[^/\\]+\.(?:pem|key|p12|pfx)$)|[/\\](?:\.ssh|\.aws|\.gnupg|keyrings?)(?:[/\\]|$)/i.test(path);
 }
 
-export function isWithinWorkspace(cwd: string, path: string): boolean {
-	const root = resolve(cwd);
-	const target = resolve(cwd, path);
+function within(root: string, target: string): boolean {
 	const rel = relative(root, target);
 	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+export function canonicalContextPath(path: string): string {
+	try { return realpathSync.native(resolve(path)); }
+	catch { return resolve(path); }
+}
+
+export function normalizeWorkspaceRoots(cwd: string, requested: unknown = []): string[] {
+	const primary = canonicalContextPath(cwd);
+	const values = Array.isArray(requested) ? requested : [];
+	if (values.length > 8) throw new Error("workspace root list exceeds 8 entries");
+	const roots = [primary];
+	for (const value of values) {
+		if (typeof value !== "string" || !value.trim() || !isAbsolute(value)) throw new Error("additional workspace roots must be non-empty absolute paths");
+		const lexical = resolve(value);
+		if (lexical === resolve(cwd) || canonicalContextPath(lexical) === primary) continue;
+		if (lexical === "/") throw new Error("filesystem root cannot be approved as a workspace root");
+		if (isSensitivePath(lexical)) throw new Error("sensitive path cannot be approved as a workspace root");
+		let canonical: string;
+		try {
+			if (!statSync(lexical).isDirectory()) throw new Error("workspace root is not a directory");
+			canonical = realpathSync.native(lexical);
+		} catch (error) {
+			throw new Error(`workspace root is unavailable: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		if (canonical !== lexical) throw new Error("workspace root must use its canonical non-symlink path");
+		if (!roots.includes(canonical)) roots.push(canonical);
+	}
+	if (roots.length > 8) throw new Error("workspace root list exceeds 8 entries");
+	return roots;
+}
+
+export function workspaceRootForCwd(primaryCwd: string, workspaceRoots: string[] | undefined, candidate: string): string | undefined {
+	const roots = normalizeWorkspaceRoots(primaryCwd, workspaceRoots ?? []);
+	const canonical = canonicalContextPath(candidate);
+	return roots.find((root) => root === canonical);
+}
+
+export function isWithinWorkspace(cwd: string, path: string, workspaceRoots?: string[]): boolean {
+	return !!resolvedPathWithinWorkspaces(cwd, workspaceRoots ?? [cwd], path);
 }
 
 function resolvedThroughExistingAncestor(path: string): string | undefined {
@@ -102,21 +140,31 @@ function resolvedThroughExistingAncestor(path: string): string | undefined {
 	}
 }
 
-export function resolvedPathWithinWorkspace(cwd: string, path: string): string | undefined {
-	if (!isWithinWorkspace(cwd, path)) return undefined;
-	const root = resolvedThroughExistingAncestor(cwd);
-	const target = resolvedThroughExistingAncestor(resolve(cwd, path));
-	if (!root || !target) return undefined;
-	const rel = relative(root, target);
-	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel)) ? target : undefined;
+export function resolvedPathWithinWorkspaces(cwd: string, workspaceRoots: string[] | undefined, path: string): string | undefined {
+	const roots = normalizeWorkspaceRoots(cwd, workspaceRoots ?? []);
+	const lexicalTarget = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
+	const eligible = isAbsolute(path)
+		? roots.filter((root) => within(root, lexicalTarget)).sort((a, b) => b.length - a.length)
+		: [roots[0]!].filter((root) => within(root, lexicalTarget));
+	const selected = eligible[0];
+	if (!selected) return undefined;
+	const root = resolvedThroughExistingAncestor(selected);
+	const target = resolvedThroughExistingAncestor(lexicalTarget);
+	if (!root || !target || !within(root, target)) return undefined;
+	return target;
 }
 
-export function safeEvidencePath(cwd: string, path: string): string {
+export function resolvedPathWithinWorkspace(cwd: string, path: string): string | undefined {
+	return resolvedPathWithinWorkspaces(cwd, [cwd], path);
+}
+
+export function safeEvidencePath(cwd: string, path: string, workspaceRoots?: string[]): string {
 	if (isSensitivePath(path)) return "[sensitive-path-redacted]";
-	const resolved = resolvedPathWithinWorkspace(cwd, path);
+	const resolved = resolvedPathWithinWorkspaces(cwd, workspaceRoots ?? [cwd], path);
 	if (!resolved) return "[outside-workspace]";
 	if (isSensitivePath(resolved)) return "[sensitive-path-redacted]";
-	return relative(resolve(cwd), resolve(cwd, path)) || ".";
+	const primary = canonicalContextPath(cwd);
+	return within(primary, resolved) ? relative(primary, resolved) || "." : resolved;
 }
 
 export function validateDag(nodes: GoalNode[]): string[] {
@@ -176,6 +224,7 @@ export function createGoalSetupState(outcome: string, ctx: ExtensionContext): Go
 		goalId: makeId("goal"),
 		sessionId: ctx.sessionManager.getSessionId(),
 		cwd: ctx.cwd,
+		workspaceRoots: normalizeWorkspaceRoots(ctx.cwd),
 		status: "setting_up",
 		phase: "setup",
 		generation: 1,
@@ -201,6 +250,7 @@ export function createGoalSetupState(outcome: string, ctx: ExtensionContext): Go
 		recoveryCount: 0,
 		auditFailureCount: 0,
 		auditRejectionRepeatCount: 0,
+		auditExecutionRepeatCount: 0,
 		verificationFailureCount: 0,
 		noProgressCount: 0,
 		repeatedToolCalls: {},
@@ -240,6 +290,7 @@ export function createGoalState(draft: GoalDraft, ctx: ExtensionContext, origina
 		goalId: makeId("goal"),
 		sessionId: ctx.sessionManager.getSessionId(),
 		cwd: ctx.cwd,
+		workspaceRoots: normalizeWorkspaceRoots(ctx.cwd, draft.workspaceRoots),
 		status: "awaiting_approval",
 		phase: "setup",
 		generation: 1,
@@ -269,6 +320,7 @@ export function createGoalState(draft: GoalDraft, ctx: ExtensionContext, origina
 		recoveryCount: 0,
 		auditFailureCount: 0,
 		auditRejectionRepeatCount: 0,
+		auditExecutionRepeatCount: 0,
 		verificationFailureCount: 0,
 		noProgressCount: 0,
 		repeatedToolCalls: {},
@@ -304,6 +356,8 @@ export function normalizeState(raw: unknown): GoalState | undefined {
 		!Array.isArray(value.plan)
 	) return undefined;
 	value.generation = Number.isInteger(value.generation) ? value.generation : 1;
+	try { value.workspaceRoots = normalizeWorkspaceRoots(value.cwd, Array.isArray(value.workspaceRoots) ? value.workspaceRoots : []); }
+	catch { value.workspaceRoots = normalizeWorkspaceRoots(value.cwd); }
 	value.revision = Number.isInteger(value.revision) ? value.revision : 0;
 	value.plan = value.plan.map((node) => ({ ...node, commands: Array.isArray(node.commands) ? node.commands : [] }));
 	value.verificationChecks = Array.isArray(value.verificationChecks) ? value.verificationChecks : [];
@@ -324,6 +378,9 @@ export function normalizeState(raw: unknown): GoalState | undefined {
 	value.recoveryCount = value.recoveryCount ?? 0;
 	value.auditFailureCount = value.auditFailureCount ?? 0;
 	value.auditRejectionRepeatCount = value.auditRejectionRepeatCount ?? 0;
+	value.auditExecutionRepeatCount = value.auditExecutionRepeatCount ?? 0;
+	if (!value.auditExecution || typeof value.auditExecution !== "object" || typeof value.auditExecution.code !== "string" || typeof value.auditExecution.fingerprint !== "string") value.auditExecution = undefined;
+	if (typeof value.lastAuditExecutionInputFingerprint !== "string") value.lastAuditExecutionInputFingerprint = undefined;
 	value.verificationFailureCount = value.verificationFailureCount ?? 0;
 	value.noProgressCount = value.noProgressCount ?? 0;
 	value.completionCandidate = !!value.completionCandidate;
@@ -381,7 +438,7 @@ export class GoalStore {
 	}
 
 	private key(ctx: ExtensionContext): string {
-		return `${ctx.sessionManager.getSessionId()}\u0000${ctx.cwd}`;
+		return `${ctx.sessionManager.getSessionId()}\u0000${canonicalContextPath(ctx.cwd)}`;
 	}
 
 	private sessionDir(ctx: ExtensionContext): string {
@@ -402,7 +459,7 @@ export class GoalStore {
 			.find((entry) => entry.type === "custom" && entry.customType === STATE_CUSTOM_TYPE) as { data?: unknown } | undefined;
 		const expectedSessionId = ctx.sessionManager.getSessionId();
 		const sameContext = (state: GoalState | undefined): state is GoalState =>
-			!!state && state.sessionId === expectedSessionId && state.cwd === ctx.cwd;
+			!!state && state.sessionId === expectedSessionId && canonicalContextPath(state.cwd) === canonicalContextPath(ctx.cwd);
 		const branchState = normalizeState(latest?.data === undefined ? undefined : structuredClone(latest.data));
 		let mirrorState: GoalState | undefined;
 		const path = this.statePath(ctx);

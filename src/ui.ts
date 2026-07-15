@@ -70,8 +70,9 @@ export function setupContent(state: GoalState, width: number): string[] {
 	section(lines, "Done when", state.criteria.map((criterion) => `${criterion.id}  ${criterion.text}`), width);
 	section(lines, "Plan", state.plan.map((node, index) => `${index + 1}. ${node.title}${node.description ? ` — ${node.description}` : ""}`), width);
 	section(lines, "Verification", state.verificationChecks.map((check) => `${check.id}  ${check.label} (${check.kind})`), width);
+	section(lines, "Approved workspace roots", state.workspaceRoots, width);
 	section(lines, "Authority", [
-		`Safe work beneath ${state.cwd}: read, write, and local build/test processes.`,
+		`Safe work beneath approved roots; relative paths resolve from ${state.cwd}.`,
 		...(state.authorities.length ? state.authorities.map(authorityScopeText) : ["No external or high-risk actions pre-approved."]),
 	], width);
 	if (state.constraints.length) section(lines, "Constraints", state.constraints, width);
@@ -96,6 +97,12 @@ export function detailContent(state: GoalState, width: number): string[] {
 	section(lines, "Criteria", state.criteria.map((criterion) => `${criterion.status === "met" ? "✓" : criterion.status === "failed" ? "✗" : criterion.status === "waived" ? "–" : "○"} ${criterion.text}`), width);
 	section(lines, "Plan", state.plan.map((node) => `${node.status === "done" ? "✓" : node.status === "in_progress" ? "▶" : node.status === "blocked" ? "!" : "○"} ${node.title}`), width);
 	section(lines, "Recent evidence", state.evidence.length ? state.evidence.slice(-8).map((evidence) => `${evidence.kind}: ${evidence.summary}`) : ["No evidence recorded yet."] , width);
+	if (state.workspaceRoots.length > 1) section(lines, "Approved workspace roots", state.workspaceRoots, width);
+	if (state.auditExecution) section(lines, "Latest audit execution failure", [
+		`${state.auditExecution.code} at ${state.auditExecution.stage}: ${state.auditExecution.message}`,
+		`Elapsed: ${state.auditExecution.elapsedMs}ms; attempt: ${state.auditExecution.attemptCount}; repeat: ${state.auditExecutionRepeatCount}; retryable: ${state.auditExecution.retryable}`,
+		`Action: ${state.auditExecution.suggestedAction}`,
+	], width);
 	const rejection = [...state.auditReports].reverse().find((report) => report.verdict === "fail");
 	if (rejection) section(lines, "Latest audit rejection", rejection.diagnostic ? [
 		`${rejection.diagnostic.code}: ${rejection.diagnostic.message}`,

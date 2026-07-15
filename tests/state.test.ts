@@ -61,12 +61,16 @@ test("schema-1 normalization preserves legacy blocker counters and defaults new 
 	raw.repeatedBlockers = { legacy: 2 };
 	delete raw.recoveryEvidence;
 	delete raw.auditRejectionRepeatCount;
+	delete raw.auditExecutionRepeatCount;
+	delete raw.workspaceRoots;
 	delete raw.lastRejectedAuditInputFingerprint;
 	delete raw.plan[0].commands;
 	const restored = normalizeState(raw)!;
 	assert.deepEqual(restored.repeatedBlockers, { legacy: 2 });
 	assert.deepEqual(restored.recoveryEvidence, []);
 	assert.equal(restored.auditRejectionRepeatCount, 0);
+	assert.equal(restored.auditExecutionRepeatCount, 0);
+	assert.deepEqual(restored.workspaceRoots, ["/tmp/work"]);
 	assert.deepEqual(restored.plan[0].commands, []);
 	delete raw.repeatedBlockers;
 	assert.deepEqual(normalizeState(raw)!.repeatedBlockers, {});

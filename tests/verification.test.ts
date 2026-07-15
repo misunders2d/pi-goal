@@ -66,6 +66,20 @@ test("verification runner denies shells, sensitive paths, and workspace escape",
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("verification command executes in an explicitly approved secondary root", async () => {
+	const base = mkdtempSync(join(tmpdir(), "pi-goal-verify-multiroot-"));
+	try {
+		const primary = join(base, "primary"); const secondary = join(base, "secondary"); const outside = join(base, "outside");
+		mkdirSync(primary); mkdirSync(secondary); mkdirSync(outside);
+		writeFileSync(join(secondary, "marker.txt"), "secondary\n");
+		const approved = await runVerificationCheck({ id: "MULTI", kind: "command_exit", label: "secondary cwd", executable: "node", args: ["-e", "const fs=require('fs');process.exit(fs.readFileSync('marker.txt','utf8')==='secondary\\n'?0:1)"], cwd: secondary }, primary, undefined, [primary, secondary]);
+		assert.equal(approved.passed, true);
+		const denied = await runVerificationCheck({ id: "OUT", kind: "command_exit", label: "outside cwd", executable: "node", args: ["--version"], cwd: outside }, primary, undefined, [primary, secondary]);
+		assert.equal(denied.passed, false);
+		assert.match(denied.summary, /approved workspace/);
+	} finally { rmSync(base, { recursive: true, force: true }); }
+});
+
 test("verification rejects symlinks that resolve outside goal cwd", async () => {
 	const base = mkdtempSync(join(tmpdir(), "pi-goal-symlink-"));
 	try {
@@ -82,6 +96,19 @@ test("verification rejects symlinks that resolve outside goal cwd", async () => 
 		assert.match(result.summary, /leaves the approved workspace/);
 		assert.match(broken.summary, /leaves the approved workspace/);
 	} finally { rmSync(base, { recursive: true, force: true }); }
+});
+
+test("verification child strips NODE_OPTIONS injection", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-node-options-"));
+	const previous = process.env.NODE_OPTIONS;
+	try {
+		process.env.NODE_OPTIONS = "--require=/definitely/missing/pi-goal-injection.js";
+		const result = await runVerificationCheck({ id: "ENV", kind: "command_exit", label: "safe node env", executable: "node", args: ["-e", "process.exit(process.env.NODE_OPTIONS ? 1 : 0)"] }, root);
+		assert.equal(result.passed, true);
+	} finally {
+		if (previous === undefined) delete process.env.NODE_OPTIONS; else process.env.NODE_OPTIONS = previous;
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 test("command timeout is explicit and distinct from ordinary exit", async () => {

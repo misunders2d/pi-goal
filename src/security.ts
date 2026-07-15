@@ -1,7 +1,7 @@
 import { isAbsolute, relative, resolve } from "node:path";
 import type { ToolInfo } from "@earendil-works/pi-coding-agent";
 import { hardCommandDenyReason, matchingCommandAuthorities, parseSimpleCommand } from "./authority.ts";
-import { canonicalJson, inputHash, isSensitivePath, resolvedPathWithinWorkspace } from "./state.ts";
+import { canonicalJson, canonicalContextPath, inputHash, isSensitivePath, resolvedPathWithinWorkspace, resolvedPathWithinWorkspaces, workspaceRootForCwd } from "./state.ts";
 import type { ActionAuthority, ActionClass, GoalState } from "./types.ts";
 
 export interface SafetyDecision {
@@ -181,7 +181,7 @@ function obviousHardCommandRisk(command: string, cwd: string): string | undefine
 	return undefined;
 }
 
-function commandRisk(command: string, cwd: string, agentDir?: string): { risky: boolean; reason?: string; recoverable?: boolean } {
+function commandRisk(command: string, cwd: string, agentDir?: string, workspaceRoots: string[] = [cwd]): { risky: boolean; reason?: string; recoverable?: boolean } {
 	if (!command.trim()) return { risky: true, reason: "empty command", recoverable: true };
 	const hardRisk = obviousHardCommandRisk(command, cwd);
 	if (hardRisk) return { risky: true, reason: hardRisk };
@@ -201,7 +201,11 @@ function commandRisk(command: string, cwd: string, agentDir?: string): { risky: 
 		if (isExactReadOnlySystemctl(tokens)) continue;
 		if (executable === "cd") {
 			const target = tokens[1];
-			if (tokens.length !== 2 || !target || !resolvedPathWithinWorkspace(cwd, target)) return { risky: true, reason: "cd target leaves the approved workspace", recoverable: true };
+			if (tokens.length !== 2 || !target) return { risky: true, reason: "cd target leaves the approved workspace", recoverable: true };
+			if (!resolvedPathWithinWorkspace(cwd, target)) {
+				const approvedSecondary = workspaceRootForCwd(cwd, workspaceRoots, target);
+				return { risky: true, reason: approvedSecondary ? "secondary-root commands require exact typed executable authority" : "cd target leaves the approved workspace", recoverable: true };
+			}
 			continue;
 		}
 		if (ALWAYS_RISKY.has(executable)) return { risky: true, reason: `${executable} changes privileged, service, infrastructure, or remote state` };
@@ -238,7 +242,7 @@ export function classifyToolCall(
 	const paths = extractPaths(input);
 	if (paths.some(isSensitivePath)) return { allow: false, reason: "secret/auth/key paths are outside goal evidence authority", actionClass: "workspace_read", recoverable: true };
 	if (paths.some((path) => isGoalPrivatePath(state.cwd, agentDir, path))) return { allow: false, reason: "goal-private state is not worker-readable", actionClass: "workspace_read", recoverable: true };
-	const resolvedPaths = paths.map((path) => resolvedPathWithinWorkspace(state.cwd, path));
+	const resolvedPaths = paths.map((path) => resolvedPathWithinWorkspaces(state.cwd, state.workspaceRoots, path));
 	if (paths.length && resolvedPaths.some((path) => !path)) {
 		const writeLike = toolName === "write" || toolName === "edit";
 		return { allow: false, reason: "tool path leaves the approved workspace or traverses a symlink boundary", actionClass: writeLike ? "workspace_write" : "workspace_read", recoverable: writeLike ? undefined : true };
@@ -249,20 +253,21 @@ export function classifyToolCall(
 	if (["read", "grep", "find", "ls"].includes(toolName)) return { allow: true, actionClass: "workspace_read" };
 	if (toolName === "bash") {
 		const commandText = typeof input.command === "string" ? input.command : "";
-		const parsed = parseSimpleCommand(commandText, state.cwd);
+		const parsed = parseSimpleCommand(commandText, state.cwd, state.workspaceRoots);
 		if (parsed.command) {
 			const hardDeny = hardCommandDenyReason(parsed.command);
 			if (hardDeny) return { allow: false, reason: hardDeny, actionClass: "destructive" };
 			const commandMatch = matchingCommandAuthorities(state, parsed.command);
 			if (commandMatch.authorities) return { allow: true, actionClass: commandMatch.authorities.at(-1)?.actionClass ?? "local_process", authorityIds: commandMatch.authorities.map((authority) => authority.id) };
-			const risk = commandRisk(commandText, state.cwd, agentDir);
+			if (canonicalContextPath(parsed.command.cwd) !== canonicalContextPath(state.cwd)) return { allow: false, reason: `missing typed ${commandMatch.missing.join(" + ") || "local_process"} authority for command cwd ${JSON.stringify(parsed.command.cwd)}`, actionClass: "local_process" };
+			const risk = commandRisk(commandText, state.cwd, agentDir, state.workspaceRoots);
 			if (!risk.risky) return { allow: true, actionClass: "local_process" };
 			if (risk.recoverable) return { allow: false, reason: risk.reason, actionClass: "local_process", recoverable: true };
 			const exactAuthority = matchingAuthority(state, toolName, input);
 			if (exactAuthority?.inputHash && !exactAuthority.command) return { allow: true, actionClass: exactAuthority.actionClass, authorityId: exactAuthority.id };
 			return { allow: false, reason: `missing typed ${commandMatch.missing.join(" + ")} authority for executable ${JSON.stringify(parsed.command.executable)} in ${JSON.stringify(state.cwd)}`, actionClass: commandMatch.missing.includes("external_write") ? "external_write" : "local_process" };
 		}
-		const risk = commandRisk(commandText, state.cwd, agentDir);
+		const risk = commandRisk(commandText, state.cwd, agentDir, state.workspaceRoots);
 		if (!risk.risky) return { allow: true, actionClass: "local_process" };
 		return { allow: false, reason: parsed.error ?? risk.reason, actionClass: "local_process", recoverable: risk.recoverable };
 	}
@@ -287,9 +292,6 @@ export function canonicalTargetSummary(input: unknown): string {
 	return serialized.length <= 180 ? serialized : `${serialized.slice(0, 180)}…`;
 }
 
-export function pathLeavesWorkspace(cwd: string, path: string): boolean {
-	const root = resolve(cwd);
-	const target = resolve(cwd, path);
-	const rel = relative(root, target);
-	return rel.startsWith("..") || isAbsolute(rel);
+export function pathLeavesWorkspace(cwd: string, path: string, workspaceRoots: string[] = [cwd]): boolean {
+	return !resolvedPathWithinWorkspaces(cwd, workspaceRoots, path);
 }

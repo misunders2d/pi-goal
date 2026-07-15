@@ -1,9 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { spawn } from "node:child_process";
-import { Type } from "typebox";
-import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { isSensitivePath, redactText, resolvedPathWithinWorkspace, safeEvidencePath } from "./state.ts";
+import { isSensitivePath, redactText, resolvedPathWithinWorkspaces, safeEvidencePath, workspaceRootForCwd } from "./state.ts";
 import type { GoalState, VerificationCheck, VerificationResult } from "./types.ts";
 
 const DENIED_EXECUTABLES = new Set([
@@ -14,7 +12,7 @@ const DENIED_EXECUTABLES = new Set([
 function safeEnvironment(): NodeJS.ProcessEnv {
 	const allowed = /^(?:PATH|HOME|USER|LOGNAME|SHELL|TMPDIR|TMP|TEMP|LANG|LC_[A-Z_]+|TERM|COLORTERM|CI|NO_COLOR|FORCE_COLOR|NODE_[A-Z_]+|npm_config_[A-Za-z_]+)$/;
 	return Object.fromEntries(
-		Object.entries(process.env).filter(([key, value]) => value !== undefined && allowed.test(key) && !/(?:token|secret|password|credential|auth|cookie|key)/i.test(key)),
+		Object.entries(process.env).filter(([key, value]) => value !== undefined && key !== "NODE_OPTIONS" && allowed.test(key) && !/(?:token|secret|password|credential|auth|cookie|key)/i.test(key)),
 	);
 }
 
@@ -100,20 +98,20 @@ function jsonPointer(value: unknown, pointer: string): unknown {
 	return current;
 }
 
-function checkedPath(cwd: string, path: string): string {
+function checkedPath(cwd: string, path: string, workspaceRoots: string[] = [cwd]): string {
 	if (isSensitivePath(path)) throw new Error("verification path is secret-like and cannot be inspected");
-	const resolved = resolvedPathWithinWorkspace(cwd, path);
+	const resolved = resolvedPathWithinWorkspaces(cwd, workspaceRoots, path);
 	if (!resolved) throw new Error("verification path leaves the approved workspace");
 	if (isSensitivePath(resolved)) throw new Error("verification path resolves to a secret-like target");
 	return resolved;
 }
 
-export function validateVerificationCheckDefinition(check: VerificationCheck, workspace: string): void {
+export function validateVerificationCheckDefinition(check: VerificationCheck, workspace: string, workspaceRoots: string[] = [workspace]): void {
 	switch (check.kind) {
 		case "file_exists":
 		case "file_contains":
 		case "json_equals":
-			checkedPath(workspace, check.path);
+			checkedPath(workspace, check.path, workspaceRoots);
 			if (check.kind === "file_contains" && check.regex) {
 				try { new RegExp(check.pattern, "m"); }
 				catch { throw new Error("verification regex is invalid"); }
@@ -131,44 +129,44 @@ export function validateVerificationCheckDefinition(check: VerificationCheck, wo
 				if (operation === "run" && !/^(?:test|check|lint|build|typecheck|verify)(?::[A-Za-z0-9._-]+)?$/.test(check.args[1] ?? "")) throw new Error("verification npm script is outside the test/check/lint/build allowlist");
 			}
 			if (basename === "git" && !["status", "diff", "show", "log", "rev-parse", "ls-files", "grep"].includes(check.args[0] ?? "")) throw new Error("verification git operation is not read-only");
-			if (check.cwd) checkedPath(workspace, check.cwd);
-			if (isAbsolute(check.executable)) checkedPath(workspace, check.executable);
+			if (check.cwd && !resolvedPathWithinWorkspaces(workspace, workspaceRoots, check.cwd)) throw new Error("verification command cwd must remain within an approved workspace root");
+			if (isAbsolute(check.executable)) checkedPath(workspace, check.executable, workspaceRoots);
 			return;
 		}
 		case "git_status":
 			return;
 		case "git_diff":
-			for (const path of check.paths ?? []) checkedPath(workspace, path);
+			for (const path of check.paths ?? []) checkedPath(workspace, path, workspaceRoots);
 	}
 }
 
-function validateExecutable(check: Extract<VerificationCheck, { kind: "command_exit" }>, workspace: string): { executable: string; cwd: string } {
-	validateVerificationCheckDefinition(check, workspace);
-	const cwd = check.cwd ? checkedPath(workspace, check.cwd) : workspace;
-	const executable = isAbsolute(check.executable) ? checkedPath(workspace, check.executable) : check.executable;
+function validateExecutable(check: Extract<VerificationCheck, { kind: "command_exit" }>, workspace: string, workspaceRoots: string[]): { executable: string; cwd: string } {
+	validateVerificationCheckDefinition(check, workspace, workspaceRoots);
+	const cwd = check.cwd ? checkedPath(workspace, check.cwd, workspaceRoots) : workspaceRootForCwd(workspace, workspaceRoots, workspace)!;
+	const executable = isAbsolute(check.executable) ? checkedPath(cwd, check.executable, workspaceRoots) : check.executable;
 	return { executable, cwd };
 }
 
-export async function runVerificationCheck(check: VerificationCheck, workspace: string, signal?: AbortSignal): Promise<VerificationResult> {
+export async function runVerificationCheck(check: VerificationCheck, workspace: string, signal?: AbortSignal, workspaceRoots: string[] = [workspace]): Promise<VerificationResult> {
 	const started = Date.now();
 	try {
 		switch (check.kind) {
 			case "file_exists": {
-				const passed = existsSync(checkedPath(workspace, check.path));
+				const passed = existsSync(checkedPath(workspace, check.path, workspaceRoots));
 				return { checkId: check.id, passed, summary: passed ? "required file exists" : "required file is missing", durationMs: Date.now() - started };
 			}
 			case "file_contains": {
-				const text = readFileSync(checkedPath(workspace, check.path), "utf8");
+				const text = readFileSync(checkedPath(workspace, check.path, workspaceRoots), "utf8");
 				const passed = check.regex ? new RegExp(check.pattern, "m").test(text) : text.includes(check.pattern);
 				return { checkId: check.id, passed, summary: passed ? "required content found" : "required content not found", durationMs: Date.now() - started };
 			}
 			case "json_equals": {
-				const document = JSON.parse(readFileSync(checkedPath(workspace, check.path), "utf8"));
+				const document = JSON.parse(readFileSync(checkedPath(workspace, check.path, workspaceRoots), "utf8"));
 				const passed = JSON.stringify(jsonPointer(document, check.pointer)) === JSON.stringify(check.value);
 				return { checkId: check.id, passed, summary: passed ? "JSON value matches" : "JSON value differs", durationMs: Date.now() - started };
 			}
 			case "command_exit": {
-				const { executable, cwd } = validateExecutable(check, workspace);
+				const { executable, cwd } = validateExecutable(check, workspace, workspaceRoots);
 				const result = await runProcess(executable, check.args, cwd, Math.max(1_000, Math.min(check.timeoutMs ?? 120_000, 900_000)), signal);
 				const expected = check.expectedExitCode ?? 0;
 				const passed = !result.timedOut && !result.aborted && result.exitCode === expected;
@@ -203,7 +201,7 @@ export async function runVerificationCheck(check: VerificationCheck, workspace: 
 				return { checkId: check.id, passed, summary: passed ? (expectedClean ? "git worktree is clean" : "git worktree contains changes") : (expectedClean ? "git worktree contains changes" : "git worktree is clean"), exitCode: passed ? 0 : 1, durationMs: result.durationMs };
 			}
 			case "git_diff": {
-				const args = ["diff", "--quiet", ...(check.paths?.length ? ["--", ...check.paths.map((path) => checkedPath(workspace, path))] : [])];
+				const args = ["diff", "--quiet", ...(check.paths?.length ? ["--", ...check.paths.map((path) => checkedPath(workspace, path, workspaceRoots))] : [])];
 				const result = await runProcess("git", args, workspace, 30_000, signal);
 				const expectedEmpty = check.empty !== false;
 				const passed = expectedEmpty ? result.exitCode === 0 : result.exitCode === 1;
@@ -241,22 +239,6 @@ function labelApprovedCheckResult(check: VerificationCheck, result: Verification
 
 export async function runAllChecks(state: GoalState, signal?: AbortSignal): Promise<VerificationResult[]> {
 	const results: VerificationResult[] = [];
-	for (const check of state.verificationChecks) results.push(labelApprovedCheckResult(check, await runVerificationCheck(check, state.cwd, signal), state.cwd));
+	for (const check of state.verificationChecks) results.push(labelApprovedCheckResult(check, await runVerificationCheck(check, state.cwd, signal, state.workspaceRoots), state.cwd));
 	return results;
-}
-
-export function createAuditorCheckTool(getState: () => GoalState): ToolDefinition {
-	return defineTool({
-		name: "pi_goal_run_check",
-		label: "Run Approved Goal Check",
-		description: "Run one setup-approved verification check by ID. The auditor cannot alter the check definition.",
-		parameters: Type.Object({ checkId: Type.String() }),
-		execute: async (_toolCallId, params, signal) => {
-			const state = getState();
-			const check = state.verificationChecks.find((item) => item.id === params.checkId);
-			if (!check) throw new Error(`Unknown approved verification check: ${params.checkId}`);
-			const result = await runVerificationCheck(check, state.cwd, signal);
-			return { content: [{ type: "text" as const, text: JSON.stringify(result) }], details: result };
-		},
-	});
 }

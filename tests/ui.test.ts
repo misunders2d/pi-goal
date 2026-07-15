@@ -67,6 +67,20 @@ test("detail content surfaces actionable audit rejection diagnostics", () => {
 	assert.match(text, /only after material evidence/);
 });
 
+test("setup and detail expose approved roots and bounded audit execution failure", () => {
+	const value = state();
+	value.workspaceRoots.push("/media/example/repo");
+	value.auditExecution = { code: "AUDIT_TIMEOUT", stage: "prompt", message: "isolated auditor exceeded deadline", elapsedMs: 90000, attemptCount: 1, retryable: false, suggestedAction: "Do not retry unchanged", fingerprint: "audit-fingerprint", createdAt: new Date().toISOString() };
+	value.auditExecutionRepeatCount = 1;
+	const setup = setupContent(value, 90).join("\n");
+	const detail = detailContent(value, 90).join("\n");
+	assert.match(setup, /Approved workspace roots/);
+	assert.match(setup, /\/media\/example\/repo/);
+	assert.match(detail, /Latest audit execution failure/);
+	assert.match(detail, /AUDIT_TIMEOUT at prompt/);
+	assert.match(detail, /Do not retry unchanged/);
+});
+
 test("panel layout fits narrow terminals and avoids unnecessary wide scrolling", () => {
 	const narrow = panelLayout(42, 30);
 	assert.deepEqual(narrow, { viewport: 25, showIndicator: true, maxBoxRows: 28 });

@@ -1,5 +1,5 @@
 import { basename } from "node:path";
-import { isSensitivePath, resolvedPathWithinWorkspace } from "./state.ts";
+import { isSensitivePath, resolvedPathWithinWorkspace, resolvedPathWithinWorkspaces, workspaceRootForCwd } from "./state.ts";
 import type { ActionAuthority, ActionClass, CommandAuthorityPolicy, CommandInvocation, GoalDraft, GoalState, VerificationCheck } from "./types.ts";
 
 export interface ParsedCommand {
@@ -33,19 +33,32 @@ function tokenize(command: string): string[] | undefined {
 	return tokens;
 }
 
-export function parseSimpleCommand(command: string, cwd: string): { command?: ParsedCommand; error?: string } {
+export function parseSimpleCommand(command: string, cwd: string, workspaceRoots: string[] = [cwd]): { command?: ParsedCommand; error?: string } {
 	if (!command.trim()) return { error: "empty command" };
+	const separators = command.match(/&&/g)?.length ?? 0;
+	if (separators === 1) {
+		const [left, right] = command.split(/&&/, 2);
+		const cd = tokenize(left ?? "");
+		if (cd?.length === 2 && cd[0] === "cd" && isAbsolutePath(cd[1]!)) {
+			const target = workspaceRootForCwd(cwd, workspaceRoots, cd[1]!);
+			if (!target) return { error: "cd target must exactly equal an approved workspace root" };
+			return parseSimpleCommand(right ?? "", target, workspaceRoots);
+		}
+		return { error: "only exact cd <approved-root> && <simple-command> is allowed" };
+	}
 	if (/(?:&&|\|\||[;|<>`\n\r]|\$\(|\$\{|[*?{}~])/.test(command)) return { error: "shell construction, expansion, pipes, redirects, or multiple commands are not allowed by typed executable authority" };
 	const tokens = tokenize(command);
 	if (!tokens?.length) return { error: "command quoting could not be parsed safely" };
 	if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0]!)) return { error: "environment assignment prefixes are not executable authority" };
 	const executable = tokens[0]!;
 	if (executable.includes("/")) {
-		const resolved = resolvedPathWithinWorkspace(cwd, executable);
+		const resolved = resolvedPathWithinWorkspaces(cwd, workspaceRoots, executable);
 		if (!resolved) return { error: "executable path leaves the approved workspace" };
 	}
 	return { command: { executable, args: tokens.slice(1), cwd } };
 }
+
+function isAbsolutePath(path: string): boolean { return path.startsWith("/"); }
 
 function gitHardDeny(args: string[], cwd: string): string | undefined {
 	const operation = args[0];
@@ -125,19 +138,21 @@ export function matchingCommandAuthorities(state: GoalState, command: ParsedComm
 	return { authorities: missing.length ? undefined : selected, missing };
 }
 
-export function validateCommandAuthorityDefinition(authority: Omit<ActionAuthority, "uses">, workspace: string): string[] {
+export function validateCommandAuthorityDefinition(authority: Omit<ActionAuthority, "uses">, workspace: string, workspaceRoots: string[] = [workspace]): string[] {
 	const errors: string[] = [];
 	if (authority.command && authority.toolName !== "bash") errors.push("command policy is only valid for bash authorities");
 	if (authority.toolName !== "bash") return errors;
 	if (!authority.command) errors.push("bash authority requires a typed command policy");
-	if (!authority.targets.some((target) => target.path === "cwd" && target.equals === workspace)) errors.push(`bash authority requires exact cwd target ${JSON.stringify(workspace)}`);
+	const cwdTargets = authority.targets.filter((target) => target.path === "cwd" && typeof target.equals === "string");
+	const commandCwd = cwdTargets.length === 1 ? workspaceRootForCwd(workspace, workspaceRoots, String(cwdTargets[0]!.equals)) : undefined;
+	if (!commandCwd) errors.push("bash authority requires exactly one cwd target equal to an approved workspace root");
 	const policy = authority.command;
 	if (!policy) return errors;
 	if (!policy.executable || /[\s;&|<>`$\n\r]/.test(policy.executable)) errors.push("command executable is invalid");
-	if (policy.executable.includes("/") && !resolvedPathWithinWorkspace(workspace, policy.executable)) errors.push("command executable path leaves the approved workspace");
+	if (policy.executable.includes("/") && commandCwd && !resolvedPathWithinWorkspaces(commandCwd, workspaceRoots, policy.executable)) errors.push("command executable path leaves the approved workspace");
 	if (!Array.isArray(policy.argsPrefix) || policy.argsPrefix.some((arg) => typeof arg !== "string" || /[\u0000\n\r]/.test(arg))) errors.push("command argsPrefix is invalid");
 	if (!["none", "any", "workspace_paths", "single_value"].includes(policy.trailingArgs)) errors.push("command trailingArgs policy is invalid");
-	const probe: ParsedCommand = { executable: policy.executable, args: [...policy.argsPrefix, ...(policy.trailingArgs === "single_value" ? ["probe"] : policy.trailingArgs === "workspace_paths" ? ["probe-path"] : [])], cwd: workspace };
+	const probe: ParsedCommand = { executable: policy.executable, args: [...policy.argsPrefix, ...(policy.trailingArgs === "single_value" ? ["probe"] : policy.trailingArgs === "workspace_paths" ? ["probe-path"] : [])], cwd: commandCwd ?? workspace };
 	const hard = hardCommandDenyReason(probe);
 	if (hard) errors.push(hard);
 	return errors;
@@ -147,9 +162,9 @@ function invocationFromCheck(check: VerificationCheck, workspace: string): Comma
 	return check.kind === "command_exit" ? { executable: check.executable, args: check.args, cwd: check.cwd ?? workspace } : undefined;
 }
 
-function coverageErrorsForInvocation(label: string, invocation: CommandInvocation, authorities: Omit<ActionAuthority, "uses">[], workspace: string): string[] {
-	const cwd = invocation.cwd ?? workspace;
-	if (cwd !== workspace) return [`${label}: command cwd must equal the approved worktree ${JSON.stringify(workspace)}`];
+function coverageErrorsForInvocation(label: string, invocation: CommandInvocation, authorities: Omit<ActionAuthority, "uses">[], workspace: string, workspaceRoots: string[]): string[] {
+	const cwd = workspaceRootForCwd(workspace, workspaceRoots, invocation.cwd ?? workspace);
+	if (!cwd) return [`${label}: command cwd must equal an approved workspace root`];
 	const command: ParsedCommand = { executable: invocation.executable, args: invocation.args, cwd };
 	const hard = hardCommandDenyReason(command);
 	if (hard) return [`${label}: ${hard}`];
@@ -161,14 +176,14 @@ function coverageErrorsForInvocation(label: string, invocation: CommandInvocatio
 	});
 }
 
-export function validateDraftCommandAuthorities(draft: GoalDraft, workspace: string): string[] {
-	const errors = draft.authorities.flatMap((authority) => validateCommandAuthorityDefinition(authority, workspace).map((error) => `${authority.id} ${JSON.stringify(authority.label)}: ${error}`));
+export function validateDraftCommandAuthorities(draft: GoalDraft, workspace: string, workspaceRoots: string[] = [workspace]): string[] {
+	const errors = draft.authorities.flatMap((authority) => validateCommandAuthorityDefinition(authority, workspace, workspaceRoots).map((error) => `${authority.id} ${JSON.stringify(authority.label)}: ${error}`));
 	for (const check of draft.verificationChecks) {
 		const invocation = invocationFromCheck(check, workspace);
-		if (invocation) errors.push(...coverageErrorsForInvocation(`verification check ${check.id} ${JSON.stringify(check.label)}`, invocation, draft.authorities, workspace));
+		if (invocation) errors.push(...coverageErrorsForInvocation(`verification check ${check.id} ${JSON.stringify(check.label)}`, invocation, draft.authorities, workspace, workspaceRoots));
 	}
 	for (const phase of draft.phases) {
-		for (const [index, invocation] of (phase.commands ?? []).entries()) errors.push(...coverageErrorsForInvocation(`phase ${phase.id ?? phase.title} command ${index + 1}`, invocation, draft.authorities, workspace));
+		for (const [index, invocation] of (phase.commands ?? []).entries()) errors.push(...coverageErrorsForInvocation(`phase ${phase.id ?? phase.title} command ${index + 1}`, invocation, draft.authorities, workspace, workspaceRoots));
 	}
 	return [...new Set(errors)];
 }
