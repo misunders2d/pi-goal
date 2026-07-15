@@ -18,15 +18,53 @@ function state() {
 
 test("setup and detail content remain useful at narrow, medium, and wide widths", () => {
 	for (const width of [44, 90, 140]) {
-		const setup = setupContent(state(), width);
+		const proposed = state();
+		proposed.authorities.push({ id: "A1", label: "Run exact tests", actionClass: "local_process", toolName: "bash", targets: [{ path: "cwd", equals: proposed.cwd }], command: { executable: "node", argsPrefix: ["--test"], trailingArgs: "workspace_paths" }, inputHash: "abc123", maxUses: 2, uses: 0, expiresAt: "2030-01-01T00:00:00.000Z" });
+		const setup = setupContent(proposed, width);
 		const detail = detailContent(state(), width);
 		assert.ok(setup.some((line) => line.includes("Outcome")));
 		assert.ok(setup.some((line) => line.includes("After approval")));
 		assert.ok(setup.some((line) => line.includes("CREDENTIAL")));
+		const setupText = setup.join("\n");
+		assert.match(setupText, /class=local_process/);
+		assert.match(setupText, /command=node\s+argvPrefix=/);
+		assert.match(setupText, /targets=cwd=/);
+		assert.match(setupText, /inputHash=abc123/);
+		assert.match(setupText, /expiresAt=2030/);
 		assert.ok(detail.some((line) => line.includes("Now / next")));
 		assert.ok(detail.some((line) => line.includes("Controls")));
 		assert.ok(Math.max(...setup.map((line) => line.length)) < width * 1.5, `setup has gross overflow at ${width}`);
 	}
+});
+
+test("detail content surfaces actionable audit rejection diagnostics", () => {
+	const rejected = state();
+	rejected.status = "running";
+	rejected.phase = "recovering";
+	rejected.auditRejectionRepeatCount = 1;
+	rejected.auditReports.push({
+		id: "audit-1",
+		verdict: "fail",
+		reason: "Package loading was not demonstrated",
+		criterionResults: [{ criterionId: "AC2", status: "failed", evidenceIds: [], note: "No package-load result" }],
+		missingCriteria: ["AC2"],
+		diagnostic: {
+			code: "AUDIT_REJECTED",
+			message: "Package loading was not demonstrated",
+			missingCriteria: ["AC2"],
+			gaps: [{ criterionId: "AC2", criterionText: "Independent audit proves completion", status: "failed", evidenceIds: [], note: "No package-load result", code: "criterion_missing", suggestedAction: "Record direct package-load evidence" }],
+			failedCheckIds: [],
+			suggestedAction: "Record direct package-load evidence",
+			fingerprint: "fingerprint",
+		},
+		createdAt: new Date().toISOString(),
+	});
+	const text = detailContent(rejected, 80).join("\n");
+	assert.match(text, /Latest audit rejection/);
+	assert.match(text, /AUDIT_REJECTED/);
+	assert.match(text, /AC2 criterion_missing/);
+	assert.match(text, /Record direct package-load\s+evidence/);
+	assert.match(text, /only after material evidence/);
 });
 
 test("panel layout fits narrow terminals and avoids unnecessary wide scrolling", () => {
@@ -62,7 +100,10 @@ test("detail content surfaces interruption controls and resumes only non-RISK bl
 	amendment.status = "interrupted";
 	amendment.interrupt = { class: "RISK", message: "Add runner", attempts: [], need: "Approval", recommendation: "Review", signature: "a", createdAt: new Date().toISOString(), pendingAuthorityAmendment: { authorities: [{ id: "A1", label: "pytest", actionClass: "local_process", toolName: "bash", targets: [{ path: "cwd", equals: amendment.cwd }], command: { executable: ".venv/bin/pytest", argsPrefix: [], trailingArgs: "any" }, maxUses: 10 }], rationale: "omitted runner", requestedAt: new Date().toISOString(), resumePhase: "executing", resumeCurrentAction: "Implement", resumeNextAction: "Test" } };
 	const amendmentText = detailContent(amendment, 80).join("\n");
-	assert.match(amendmentText, /Authority amendment: local_process bash \.venv\/bin\/pytest/);
+	assert.match(amendmentText, /Authority amendment: A1: pytest/);
+	assert.match(amendmentText, /class=local_process/);
+	assert.match(amendmentText, /command=\.venv\/bin\/pytest/);
+	assert.match(amendmentText, /targets=cwd=/);
 	assert.match(amendmentText, /A approve only the displayed typed authority amendment/);
 	assert.doesNotMatch(amendmentText, /P resume without changing/);
 

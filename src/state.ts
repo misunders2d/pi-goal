@@ -200,6 +200,7 @@ export function createGoalSetupState(outcome: string, ctx: ExtensionContext): Go
 		turnCount: 0,
 		recoveryCount: 0,
 		auditFailureCount: 0,
+		auditRejectionRepeatCount: 0,
 		verificationFailureCount: 0,
 		noProgressCount: 0,
 		repeatedToolCalls: {},
@@ -267,6 +268,7 @@ export function createGoalState(draft: GoalDraft, ctx: ExtensionContext, origina
 		turnCount: 0,
 		recoveryCount: 0,
 		auditFailureCount: 0,
+		auditRejectionRepeatCount: 0,
 		verificationFailureCount: 0,
 		noProgressCount: 0,
 		repeatedToolCalls: {},
@@ -275,6 +277,18 @@ export function createGoalState(draft: GoalDraft, ctx: ExtensionContext, origina
 		activeToolCalls: {},
 		backgroundWork: {},
 	};
+}
+
+export function reconcileCriterionEvidenceIds(state: Pick<GoalState, "criteria" | "evidence">): void {
+	const knownCriteria = new Set(state.criteria.map((criterion) => criterion.id));
+	const byCriterion = new Map(state.criteria.map((criterion) => [criterion.id, [] as string[]]));
+	for (const evidence of state.evidence) {
+		for (const criterionId of new Set(evidence.criterionIds)) {
+			if (!knownCriteria.has(criterionId)) continue;
+			byCriterion.get(criterionId)!.push(evidence.id);
+		}
+	}
+	for (const criterion of state.criteria) criterion.evidenceIds = [...new Set(byCriterion.get(criterion.id) ?? [])];
 }
 
 export function normalizeState(raw: unknown): GoalState | undefined {
@@ -309,10 +323,12 @@ export function normalizeState(raw: unknown): GoalState | undefined {
 	value.turnCount = value.turnCount ?? 0;
 	value.recoveryCount = value.recoveryCount ?? 0;
 	value.auditFailureCount = value.auditFailureCount ?? 0;
+	value.auditRejectionRepeatCount = value.auditRejectionRepeatCount ?? 0;
 	value.verificationFailureCount = value.verificationFailureCount ?? 0;
 	value.noProgressCount = value.noProgressCount ?? 0;
 	value.completionCandidate = !!value.completionCandidate;
 	value.setupAwaitingUser = !!value.setupAwaitingUser;
+	reconcileCriterionEvidenceIds(value as GoalState);
 	return value as GoalState;
 }
 
@@ -416,6 +432,7 @@ export class GoalStore {
 		this.state.updatedAt = now();
 		this.state.observations = this.state.observations.slice(-250);
 		this.state.evidence = this.state.evidence.slice(-500);
+		reconcileCriterionEvidenceIds(this.state);
 		this.state.evaluatorReports = this.state.evaluatorReports.slice(-100);
 		this.state.auditReports = this.state.auditReports.slice(-50);
 		this.state.recoveryEvidence = this.state.recoveryEvidence.slice(-250);
@@ -450,6 +467,7 @@ export class GoalStore {
 		if (!this.state) return;
 		this.state.revision += 1;
 		this.state.updatedAt = now();
+		reconcileCriterionEvidenceIds(this.state);
 		atomicWrite(this.statePath(ctx), `${JSON.stringify(this.state, null, 2)}\n`);
 		atomicWrite(join(this.sessionDir(ctx), "evidence.json"), `${JSON.stringify(this.state.evidence, null, 2)}\n`);
 		atomicWrite(join(this.agentDir, "pi-goal", "current", "index.json"), `${JSON.stringify({

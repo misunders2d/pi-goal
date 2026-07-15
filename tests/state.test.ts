@@ -60,13 +60,27 @@ test("schema-1 normalization preserves legacy blocker counters and defaults new 
 	const raw: any = createGoalState(draft, fakeContext("/tmp/work"));
 	raw.repeatedBlockers = { legacy: 2 };
 	delete raw.recoveryEvidence;
+	delete raw.auditRejectionRepeatCount;
+	delete raw.lastRejectedAuditInputFingerprint;
 	delete raw.plan[0].commands;
 	const restored = normalizeState(raw)!;
 	assert.deepEqual(restored.repeatedBlockers, { legacy: 2 });
 	assert.deepEqual(restored.recoveryEvidence, []);
+	assert.equal(restored.auditRejectionRepeatCount, 0);
 	assert.deepEqual(restored.plan[0].commands, []);
 	delete raw.repeatedBlockers;
 	assert.deepEqual(normalizeState(raw)!.repeatedBlockers, {});
+});
+
+test("schema-1 normalization rebuilds criterion evidence links from canonical evidence", () => {
+	const raw: any = createGoalState(draft, fakeContext("/tmp/work"));
+	raw.evidence.push({ id: "e1", kind: "tool_result", summary: "first proof", criterionIds: ["AC1", "BAD", "AC1"], paths: [], createdAt: new Date().toISOString() });
+	raw.evidence.push({ id: "e2", kind: "test_result", summary: "second proof", criterionIds: ["AC2"], paths: [], createdAt: new Date().toISOString() });
+	raw.criteria[0].evidenceIds = [];
+	raw.criteria[1].evidenceIds = ["stale"];
+	const restored = normalizeState(raw)!;
+	assert.deepEqual(restored.criteria[0].evidenceIds, ["e1"]);
+	assert.deepEqual(restored.criteria[1].evidenceIds, ["e2"]);
 });
 
 test("redaction and path boundaries fail closed", () => {

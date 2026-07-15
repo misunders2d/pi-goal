@@ -211,6 +211,28 @@ export interface EvaluatorReport {
 	createdAt: string;
 }
 
+export type AuditGapCode = "missing_criterion_result" | "criterion_unmet" | "missing_evidence" | "criterion_missing" | "audit_rejected";
+
+export interface AuditFailureGap {
+	criterionId: string;
+	criterionText: string;
+	status: CriterionStatus;
+	evidenceIds: string[];
+	note: string;
+	code: AuditGapCode;
+	suggestedAction: string;
+}
+
+export interface AuditRejectionDiagnostic {
+	code: "AUDIT_REJECTED";
+	message: string;
+	missingCriteria: string[];
+	gaps: AuditFailureGap[];
+	failedCheckIds: string[];
+	suggestedAction: string;
+	fingerprint: string;
+}
+
 export interface AuditReport {
 	id: string;
 	verdict: "pass" | "fail";
@@ -222,6 +244,7 @@ export interface AuditReport {
 		note: string;
 	}>;
 	missingCriteria: string[];
+	diagnostic?: AuditRejectionDiagnostic;
 	createdAt: string;
 }
 
@@ -264,6 +287,9 @@ export interface GoalState {
 	turnCount: number;
 	recoveryCount: number;
 	auditFailureCount: number;
+	lastRejectedAuditInputFingerprint?: string;
+	lastAuditRejectionFingerprint?: string;
+	auditRejectionRepeatCount: number;
 	verificationFailureSignature?: string;
 	verificationFailureCount: number;
 	verificationRecoveryStartedAt?: string;

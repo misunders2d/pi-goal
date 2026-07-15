@@ -1,8 +1,8 @@
 import type { ExtensionCommandContext, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { progress } from "./state.ts";
-import type { GoalSetupTranscript, GoalState } from "./types.ts";
+import { progress, redactText } from "./state.ts";
+import type { ActionAuthority, GoalSetupTranscript, GoalState } from "./types.ts";
 
 export type SetupAction = "approve" | "refine" | "cancel";
 export type DetailAction = "close" | "pause" | "resume" | "cancel" | "approve_risk" | "approve_amendment" | "resolve";
@@ -37,6 +37,25 @@ function box(theme: Theme, title: string, content: string[], width: number): str
 	return result;
 }
 
+export function authorityScopeText(authority: Omit<ActionAuthority, "uses"> | ActionAuthority): string {
+	const targets = authority.targets.length
+		? authority.targets.map((target) => `${target.path}=${JSON.stringify(target.equals)}`).join(", ")
+		: "none";
+	const command = authority.command
+		? `${authority.command.executable} argvPrefix=${JSON.stringify(authority.command.argsPrefix)} trailing=${authority.command.trailingArgs}`
+		: "none";
+	return redactText([
+		`${authority.id}: ${authority.label}`,
+		`class=${authority.actionClass}`,
+		`tool=${authority.toolName}`,
+		`maxUses=${authority.maxUses}`,
+		`command=${command}`,
+		`targets=${targets}`,
+		`inputHash=${authority.inputHash ?? "none"}`,
+		`expiresAt=${authority.expiresAt ?? "none"}`,
+	].join(" | "), Number.MAX_SAFE_INTEGER).text;
+}
+
 function section(lines: string[], title: string, values: string[], width: number): void {
 	lines.push("", title);
 	for (const value of values) {
@@ -53,7 +72,7 @@ export function setupContent(state: GoalState, width: number): string[] {
 	section(lines, "Verification", state.verificationChecks.map((check) => `${check.id}  ${check.label} (${check.kind})`), width);
 	section(lines, "Authority", [
 		`Safe work beneath ${state.cwd}: read, write, and local build/test processes.`,
-		...(state.authorities.length ? state.authorities.map((authority) => `${authority.label} — ${authority.toolName}, ${authority.maxUses} use${authority.maxUses === 1 ? "" : "s"}`) : ["No external or high-risk actions pre-approved."]),
+		...(state.authorities.length ? state.authorities.map(authorityScopeText) : ["No external or high-risk actions pre-approved."]),
 	], width);
 	if (state.constraints.length) section(lines, "Constraints", state.constraints, width);
 	if (state.nonGoals.length) section(lines, "Non-goals", state.nonGoals, width);
@@ -77,13 +96,19 @@ export function detailContent(state: GoalState, width: number): string[] {
 	section(lines, "Criteria", state.criteria.map((criterion) => `${criterion.status === "met" ? "✓" : criterion.status === "failed" ? "✗" : criterion.status === "waived" ? "–" : "○"} ${criterion.text}`), width);
 	section(lines, "Plan", state.plan.map((node) => `${node.status === "done" ? "✓" : node.status === "in_progress" ? "▶" : node.status === "blocked" ? "!" : "○"} ${node.title}`), width);
 	section(lines, "Recent evidence", state.evidence.length ? state.evidence.slice(-8).map((evidence) => `${evidence.kind}: ${evidence.summary}`) : ["No evidence recorded yet."] , width);
+	const rejection = [...state.auditReports].reverse().find((report) => report.verdict === "fail");
+	if (rejection) section(lines, "Latest audit rejection", rejection.diagnostic ? [
+		`${rejection.diagnostic.code}: ${rejection.diagnostic.message}`,
+		...(rejection.diagnostic.gaps.length ? rejection.diagnostic.gaps.map((gap) => `${gap.criterionId} ${gap.code}: ${gap.note} — ${gap.suggestedAction}`) : [rejection.diagnostic.suggestedAction]),
+		`Retry: ${state.status === "interrupted" ? "blocked pending user direction" : "only after material evidence or check results change"}`,
+	] : [redactText(rejection.reason, 800).text, ...(rejection.missingCriteria.length ? [`Missing: ${rejection.missingCriteria.map((item) => redactText(item, 300).text).join(", ")}`] : [])], width);
 	if (Object.keys(state.backgroundWork).length) section(lines, "Background work", Object.values(state.backgroundWork).map((item) => `${item.label} (${item.id})`), width);
 	if (state.interrupt) section(lines, `${state.interrupt.class} interruption`, [
 		state.interrupt.message,
 		`Tried: ${state.interrupt.attempts.join("; ") || "none"}`,
 		`Need: ${state.interrupt.need}`,
 		`Recommendation: ${state.interrupt.recommendation}`,
-		...(state.interrupt.pendingAuthorityAmendment ? state.interrupt.pendingAuthorityAmendment.authorities.map((authority) => `Authority amendment: ${authority.actionClass} ${authority.toolName} ${authority.command ? `${authority.command.executable} ${authority.command.argsPrefix.join(" ")} trailing=${authority.command.trailingArgs}` : "typed target"}`) : []),
+		...(state.interrupt.pendingAuthorityAmendment ? state.interrupt.pendingAuthorityAmendment.authorities.map((authority) => `Authority amendment: ${authorityScopeText(authority)}`) : []),
 	], width);
 	section(lines, "Controls", [
 		...(state.status === "paused"

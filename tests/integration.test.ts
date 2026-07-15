@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { IsolatedModelRunner, normalizeAuditDecision, normalizeDraft, withDeadline } from "../src/evaluator.ts";
-import piGoalExtension, { isExplicitGoalSteeringInput, isInformationalGoalInput, isLegacyAutomaticDoomLoopInterrupt, validateAuditCompletion, verificationRecoveryWindow } from "../src/index.ts";
+import piGoalExtension, { isExplicitGoalSteeringInput, isInformationalGoalInput, isLegacyAutomaticDoomLoopInterrupt, parseGoalInputIntent, validateAuditCompletion, verificationRecoveryWindow } from "../src/index.ts";
 import { SETUP_TRANSCRIPT_CUSTOM_TYPE, STATE_CUSTOM_TYPE, createGoalState, sha256 } from "../src/state.ts";
 import type { GoalDraft } from "../src/types.ts";
 
@@ -138,6 +138,19 @@ test("same-conversation clarification stays visible and blocks pre-approval work
 		assert.match(blocked.reason, /conversational and not approved/);
 		const allowed = (await harness.emit("tool_call", { type: "tool_call", toolName: "pi_goal_submit_contract", toolCallId: "s1", input: {} })).find(Boolean);
 		assert.equal(allowed, undefined);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("deterministic cancellation aliases work in setup without matching negation", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-setup-cancel-"));
+	try {
+		const harness = makeHarness(root);
+		await harness.command("goal", "Clarify this goal");
+		await harness.emit("input", { type: "input", source: "interactive", text: "do not cancel this goal" });
+		assert.equal(latestState(harness).status, "setting_up");
+		await harness.emit("input", { type: "input", source: "interactive", text: "cancel this stuck goal" });
+		assert.equal(latestState(harness).status, "cancelled");
+		assert.equal(harness.aborts, 1);
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -476,23 +489,30 @@ test("completion preflight defects stay in execution instead of normalizing reco
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("informational goal questions do not mutate generation or become steering", async () => {
+test("typed input intent keeps questions and acknowledgements non-mutating", async () => {
 	assert.equal(isInformationalGoalInput('why is it "recovering" again?'), true);
 	assert.equal(isInformationalGoalInput("what is the goal status?"), true);
 	assert.equal(isInformationalGoalInput("so? is anything happening?"), true);
 	assert.equal(isInformationalGoalInput("are you done?"), true);
 	assert.equal(isInformationalGoalInput("Also verify documentation"), false);
 	assert.equal(isExplicitGoalSteeringInput("steer goal: also add documentation"), true);
+	assert.equal(isExplicitGoalSteeringInput("Also verify documentation"), true);
+	assert.equal(parseGoalInputIntent("okay, continue"), "neutral_continue");
+	assert.equal(parseGoalInputIntent("cancel this stuck goal"), "cancel");
+	assert.equal(parseGoalInputIntent("do not cancel this goal"), "informational");
+	assert.equal(parseGoalInputIntent("don't cancel this goal"), "informational");
+	assert.equal(parseGoalInputIntent("please keep the current plan"), "unknown");
 	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
 	try {
 		const harness = makeHarness(root);
 		const initial = injectRunning(harness);
-		for (const text of ['why is it "recovering" again?', "so? is anything happening?", "are you done?"]) {
+		for (const text of ['why is it "recovering" again?', "so? is anything happening?", "are you done?", "okay, continue", "do not cancel this goal", "don't cancel this goal", "please keep the current plan"]) {
 			const results = await harness.emit("input", { type: "input", source: "interactive", text });
 			assert.equal(results.find(Boolean), undefined);
 		}
 		const persisted = latestState(harness);
 		assert.equal(persisted.generation, initial.generation);
+		assert.equal(persisted.status, "running");
 		assert.equal(persisted.outcome.amendments.length, 0);
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -503,6 +523,7 @@ test("audit-time questions are non-mutating while explicit steering exits auditi
 		const harness = makeHarness(root);
 		const state = createGoalState(draft, harness.ctx);
 		state.status = "auditing"; state.phase = "auditing"; state.completionCandidate = true;
+		state.auditFailureCount = 2; state.auditRejectionRepeatCount = 1; state.lastRejectedAuditInputFingerprint = "old-input"; state.lastAuditRejectionFingerprint = "old-diagnostic";
 		harness.branch.push({ type: "custom", customType: STATE_CUSTOM_TYPE, data: state });
 		await harness.emit("input", { type: "input", source: "interactive", text: "so? is anything happening?" });
 		let persisted = latestState(harness);
@@ -515,6 +536,9 @@ test("audit-time questions are non-mutating while explicit steering exits auditi
 		assert.equal(persisted.status, "running");
 		assert.equal(persisted.phase, "planning");
 		assert.equal(persisted.completionCandidate, false);
+		assert.equal(persisted.auditFailureCount, 0);
+		assert.equal(persisted.auditRejectionRepeatCount, 0);
+		assert.equal(persisted.lastRejectedAuditInputFingerprint, undefined);
 		assert.equal(persisted.outcome.amendments.length, 1);
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -561,6 +585,7 @@ test("evidence links recent successful observations without exposing tool-call I
 		assert.equal(persisted.evidence.length, 1);
 		assert.deepEqual(persisted.evidence[0].criterionIds, ["AC1"]);
 		assert.equal(persisted.evidence[0].nodeId, "P1");
+		assert.deepEqual(persisted.criteria[0].evidenceIds, [persisted.evidence[0].id]);
 		assert.equal(persisted.plan[0].status, "done");
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -581,9 +606,12 @@ test("multi-criterion nodes require specific evidence and remain active until al
 		await harness.emit("tool_result", { type: "tool_result", toolName: "read", toolCallId: "r1", input: { path: "one.md" }, isError: false, content: [], details: {} });
 		await assert.rejects(() => harness.tool("pi_goal_record_evidence", { goalId: multi.goalId, generation: multi.generation, summary: "ambiguous" }), /maps multiple criteria/);
 		await harness.tool("pi_goal_record_evidence", { goalId: multi.goalId, generation: multi.generation, summary: "first", criterionIds: ["AC1"] });
+		assert.deepEqual(latestState(harness).criteria[0].evidenceIds, [latestState(harness).evidence[0].id]);
+		assert.deepEqual(latestState(harness).criteria[1].evidenceIds, []);
 		assert.equal(latestState(harness).plan[0].status, "in_progress");
 		await harness.emit("tool_result", { type: "tool_result", toolName: "read", toolCallId: "r2", input: { path: "two.md" }, isError: false, content: [], details: {} });
 		await harness.tool("pi_goal_record_evidence", { goalId: multi.goalId, generation: multi.generation, summary: "second", criterionIds: ["AC2"] });
+		assert.deepEqual(latestState(harness).criteria[1].evidenceIds, [latestState(harness).evidence[1].id]);
 		assert.equal(latestState(harness).plan[0].status, "done");
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -707,6 +735,84 @@ test("full candidate audit normalizes pass to met and completes", async () => {
 		assert.equal(persisted.verificationFailureCount, 0);
 		assert.match(JSON.stringify(harness.messages), /Goal complete and independently verified/);
 		assert.doesNotMatch(readFileSync(goalArtifact(root, "events.jsonl"), "utf8"), /verification_failed|completion_preflight_failed/);
+	} finally {
+		IsolatedModelRunner.prototype.audit = originalAudit;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("audit rejection exposes actionable diagnostics and blocks an unchanged retry before another audit", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-audit-rejection-"));
+	const originalAudit = IsolatedModelRunner.prototype.audit;
+	let auditCalls = 0;
+	try {
+		const harness = makeHarness(root);
+		mkdirSync(harness.ctx.cwd, { recursive: true });
+		writeFileSync(join(harness.ctx.cwd, "package.json"), "{}\n");
+		const initial = injectRunning(harness);
+		initial.evidence.push({ id: "e1", kind: "tool_result", summary: "manifest exists", criterionIds: ["AC1"], nodeId: "P1", paths: ["package.json"], createdAt: new Date().toISOString() });
+		initial.plan[0].evidenceIds.push("e1");
+		initial.plan[0].status = "done";
+		IsolatedModelRunner.prototype.audit = async () => {
+			auditCalls += 1;
+			return normalizeAuditDecision({ verdict: "fail", reason: "Package loading was not demonstrated", criterionResults: [{ criterionId: "AC1", status: "failed", evidenceIds: ["e1"], note: "The file exists, but no package-load result is linked" }], missingCriteria: ["AC1"] });
+		};
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		await harness.tool("pi_goal_submit_completion_candidate", { goalId: initial.goalId, generation: initial.generation, summary: "ready" });
+		await harness.emit("agent_settled", { type: "agent_settled" });
+		assert.equal(auditCalls, 1);
+		let persisted = latestState(harness);
+		assert.equal(persisted.status, "running");
+		assert.equal(persisted.auditRejectionRepeatCount, 1);
+		assert.match(persisted.nextAction, /AC1: State is durable/);
+		const status = JSON.parse((await harness.tool("pi_goal_status", {})).content[0].text);
+		assert.equal(status.lastAuditRejection.code, "AUDIT_REJECTED");
+		assert.equal(status.lastAuditRejection.gaps[0].criterionId, "AC1");
+		assert.equal(status.lastAuditRejection.gaps[0].criterionText, "State is durable");
+		assert.match(status.lastAuditRejection.gaps[0].note, /no package-load result/);
+		assert.equal(status.lastAuditRejection.retryable, true);
+		const retry = await harness.tool("pi_goal_submit_completion_candidate", { goalId: initial.goalId, generation: initial.generation, summary: "unchanged retry" });
+		assert.match(retry.content[0].text, /no material evidence or approved-check result changed/);
+		assert.equal(auditCalls, 1);
+		persisted = latestState(harness);
+		assert.equal(persisted.status, "interrupted");
+		assert.equal(persisted.interrupt.class, "BLOCKER");
+		assert.equal(persisted.auditRejectionRepeatCount, 2);
+	} finally {
+		IsolatedModelRunner.prototype.audit = originalAudit;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("material new evidence permits one retry and repeated identical diagnosis becomes a blocker", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-audit-progress-"));
+	const originalAudit = IsolatedModelRunner.prototype.audit;
+	let auditCalls = 0;
+	try {
+		const harness = makeHarness(root);
+		mkdirSync(harness.ctx.cwd, { recursive: true });
+		writeFileSync(join(harness.ctx.cwd, "package.json"), "{}\n");
+		const initial = injectRunning(harness);
+		initial.evidence.push({ id: "e1", kind: "tool_result", summary: "manifest exists", criterionIds: ["AC1"], nodeId: "P1", paths: ["package.json"], createdAt: new Date().toISOString() });
+		initial.plan[0].evidenceIds.push("e1");
+		initial.plan[0].status = "done";
+		IsolatedModelRunner.prototype.audit = async () => {
+			auditCalls += 1;
+			const repeated = auditCalls > 1;
+			return normalizeAuditDecision({ verdict: "fail", reason: repeated ? "Still missing direct package loading proof" : "Package loading was not demonstrated", criterionResults: [{ criterionId: "AC1", status: "failed", evidenceIds: ["e1"], note: repeated ? "The new observation still does not prove package loading" : "The file exists, but no package-load result is linked" }], missingCriteria: ["AC1"] });
+		};
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		await harness.tool("pi_goal_submit_completion_candidate", { goalId: initial.goalId, generation: initial.generation, summary: "ready" });
+		await harness.emit("agent_settled", { type: "agent_settled" });
+		await harness.emit("tool_result", { type: "tool_result", toolName: "read", toolCallId: "new-proof", input: { path: "package.json" }, isError: false, content: [], details: {} });
+		await harness.tool("pi_goal_record_evidence", { goalId: initial.goalId, generation: initial.generation, summary: "new package-load observation", criterionIds: ["AC1"] });
+		await harness.tool("pi_goal_submit_completion_candidate", { goalId: initial.goalId, generation: initial.generation, summary: "new evidence retry" });
+		await harness.emit("agent_settled", { type: "agent_settled" });
+		assert.equal(auditCalls, 2);
+		const persisted = latestState(harness);
+		assert.equal(persisted.status, "interrupted");
+		assert.equal(persisted.interrupt.class, "BLOCKER");
+		assert.equal(persisted.auditRejectionRepeatCount, 2);
 	} finally {
 		IsolatedModelRunner.prototype.audit = originalAudit;
 		rmSync(root, { recursive: true, force: true });
@@ -1038,9 +1144,16 @@ test("human-approved authority amendment preserves active goal state and resumes
 		state.evidence.push({ id: "e1", kind: "tool_result", summary: "valuable evidence", criterionIds: ["AC1"], paths: [], createdAt: new Date().toISOString() });
 		const originalPlan = structuredClone(state.plan);
 		await harness.emit("session_start", { type: "session_start", reason: "resume" });
-		await harness.tool("pi_goal_request_authority_amendment", { goalId: state.goalId, generation: state.generation, rationale: "Add omitted venv pytest runner", authorities: [commandAuthority("A-pytest", harness.ctx.cwd, "local_process", ".venv/bin/pytest", [])] });
+		const amendment = await harness.tool("pi_goal_request_authority_amendment", { goalId: state.goalId, generation: state.generation, rationale: "Add omitted venv pytest runner", authorities: [commandAuthority("A-pytest", harness.ctx.cwd, "local_process", ".venv/bin/pytest", [])] });
+		assert.match(amendment.content[0].text, /class=local_process/);
+		assert.match(amendment.content[0].text, /command=\.venv\/bin\/pytest/);
+		assert.match(amendment.content[0].text, /targets=cwd=/);
+		assert.match(amendment.content[0].text, /maxUses=20/);
 		assert.equal(latestState(harness).status, "interrupted");
 		assert.ok(latestState(harness).interrupt.pendingAuthorityAmendment);
+		const status = JSON.parse((await harness.tool("pi_goal_status", {})).content[0].text);
+		assert.match(status.pendingAuthorityAmendment[0], /class=local_process/);
+		assert.match(status.pendingAuthorityAmendment[0], /targets=cwd=/);
 		await harness.emit("input", { type: "input", source: "interactive", text: "approve exact authority amendment" });
 		const resumed = latestState(harness);
 		assert.equal(resumed.goalId, state.goalId);

@@ -1,6 +1,6 @@
 {
   "name": "@misunders2d/pi-goal",
-  "version": "1.0.14",
+  "version": "1.0.15",
   "description": "Fire-and-forget goal mode for Pi with visual planning, autonomous recovery, evidence, and independent completion audit.",
   "license": "MIT",
   "type": "module",

@@ -8,7 +8,7 @@ A fire-and-forget goal mode for [Pi](https://pi.dev): describe an outcome, appro
 - Clarification and contract debate happen in the same conversation, with full session context.
 - Autonomous continuation until verified complete or genuinely blocked.
 - Compact live progress plus a detailed `/goal` overlay.
-- Natural-language directions steer work; informational questions do not mutate the goal.
+- Explicit steering directions mutate work; informational questions and neutral acknowledgements do not mutate the goal.
 - Durable state across compaction, reload, and session resume.
 - Bounded recovery, stale-turn protection, and doom-loop detection.
 - Evidence-backed completion through a constrained verifier and isolated auditor.
@@ -20,19 +20,19 @@ Goal mode never weakens Pi's existing permission or confirmation gates. Workspac
 ## Install
 
 ```bash
-pi install npm:@misunders2d/pi-goal@1.0.14
+pi install npm:@misunders2d/pi-goal@1.0.15
 ```
 
 Try without installing:
 
 ```bash
-pi -e npm:@misunders2d/pi-goal@1.0.14
+pi -e npm:@misunders2d/pi-goal@1.0.15
 ```
 
 Pinned GitHub release:
 
 ```bash
-pi install git:github.com/misunders2d/pi-goal@v1.0.14
+pi install git:github.com/misunders2d/pi-goal@v1.0.15
 ```
 
 ## Use
@@ -51,9 +51,9 @@ Then:
 
 `/goal <outcome>` activates setup mode in the current conversation. The same main agent sees the normal session history, resolves references from prior discussion, debates conflicts, and asks only materially necessary follow-up questions. Clarification has no artificial round limit. Before approval, operational tools are hard-blocked; the agent may only discuss the goal, inspect sanitized goal status, or submit a complete typed contract. Questions and answers remain visible in the ordinary conversation transcript. Once clear, the agent submits observable done conditions, ordered phases, mechanical verification checks, constraints, non-goals, and all foreseeable scoped authorities needed for fire-and-forget completion. Run bare `/goal` to review the contract, refine it back in the same conversation, cancel it, or approve once. Bare `/goal` otherwise opens progress and controls.
 
-Natural-language directions steer an active goal, while informational questions—including audit-time status questions—do not mutate the contract or generation. Explicit audit-time steering atomically cancels the stale audit and returns the goal to planning. The overlay provides pause, resume, cancel, blocker resolution, exact unavoidable-risk approval, and narrow authority-amendment approval. Non-RISK interruptions can resume without changing the approved contract; RISK remains limited to the displayed exact action. A running goal can request a human-approved typed authority amendment without replacing its goal ID, criteria, plan, evidence, current step, or workspace.
+A closed-world input classifier recognizes explicit steering (`steer`, `amend`, `change`, `revise`, `update`, and explicit `also`/`additionally` additions), typed controls, informational questions, and neutral acknowledgements. Informational questions—including audit-time status questions—and acknowledgements such as `okay, continue` do not mutate the contract, create steering, or increment generation. Unknown ordinary text is not silently promoted to steering. Explicit audit-time steering atomically cancels the stale audit and returns the goal to planning. Pause, resume, and cancellation aliases are deterministic exact grammars; negated phrases such as `do not cancel this goal` never cancel it. The overlay provides pause, resume, cancel, blocker resolution, exact unavoidable-risk approval, and narrow authority-amendment approval. Non-RISK interruptions can resume without changing the approved contract; RISK remains limited to the displayed exact action. A running goal can request a human-approved typed authority amendment without replacing its goal ID, criteria, plan, evidence, current step, or workspace.
 
-Contract submission validates every proposed verification check and machine-readable phase command against the declared executable authority before approval. Bash authority must name an exact executable, exact argument prefix, bounded trailing-argument policy, and exact goal cwd. Commands that require more than one action class must have every class: for example, normal `uv` execution needs `local_process` plus `network_read`, while `git push` needs `local_process` plus `external_write`. Labels and prose never grant command authority. A cwd-only Bash authority is rejected before approval. Completion preflight failures remain in execution; `recovering` is reserved for unexpected runtime divergence and bounded no-progress loops. Multi-criterion steps require criterion-specific evidence and remain active until every mapped criterion is covered. Failed approved checks expose bounded, redacted stdout and stderr, exit details, byte counts, and truncation metadata. Durable state stores only sanitized summaries and metadata. Three distinct evidenced denials or failed checks plus a successful replan can open `BLOCKER`; repeating the interruption request itself does not count. Runtime verification recovery remains capped at ten minutes. A recoverable optional tool-shape denial is recorded and blocked without changing the lifecycle phase; a safe typed fallback can continue ordinary execution. Accepted evidence also reconciles stale non-verification recovery state from older sessions. A genuine RISK requires an exact blocked action plus evidence of a safe alternative attempt. In the overlay, `A` approves only that displayed action once, while `R` rejects or redirects it. In normal input, approve a displayed pending action only with `approve exact pending risk once`; broader approval wording does not grant authority.
+Contract submission validates every proposed verification check and machine-readable phase command against the declared executable authority before approval. Bash authority must name an exact executable, exact argument prefix, bounded trailing-argument policy, and exact goal cwd. Commands that require more than one action class must have every class: for example, normal `uv` execution needs `local_process` plus `network_read`, while `git push` needs `local_process` plus `external_write`. Labels and prose never grant command authority. A cwd-only Bash authority is rejected before approval. Completion preflight failures remain in execution; `recovering` is reserved for unexpected runtime divergence and bounded no-progress loops. Multi-criterion steps require criterion-specific evidence and remain active until every mapped criterion is covered. Evidence records are canonical; criterion evidence counts are rebuilt from those records during every persistence cycle and schema-1 normalization. Failed approved checks expose bounded, redacted stdout and stderr, exit details, byte counts, and truncation metadata. Durable state stores only sanitized summaries and metadata. Audit rejections persist and display redacted reason codes, criterion text, evidence references, notes, and a suggested next action in worker context, status, and the overlay. The same rejected completion input cannot invoke the auditor again; materially different evidence or approved-check results permit one retry, while a repeated equivalent diagnostic opens one detailed `BLOCKER`. Three distinct evidenced denials or failed checks plus a successful replan can open other `BLOCKER` interruptions; repeating the interruption request itself does not count. Runtime verification recovery remains capped at ten minutes. A recoverable optional tool-shape denial is recorded and blocked without changing the lifecycle phase; a safe typed fallback can continue ordinary execution. Accepted evidence also reconciles stale non-verification recovery state from older sessions. A genuine RISK requires an exact blocked action plus evidence of a safe alternative attempt. In the overlay, `A` approves only that displayed action once, while `R` rejects or redirects it. In normal input, approve a displayed pending action only with `approve exact pending risk once`; broader approval wording does not grant authority.
 
 ## Deliberate boundary
 

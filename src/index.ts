@@ -23,10 +23,12 @@ import {
 	GoalStore,
 	createGoalSetupState,
 	createGoalState,
+	canonicalJson,
 	inputHash,
 	makeId,
 	now,
 	progressMarker,
+	reconcileCriterionEvidenceIds,
 	redactText,
 	safeEvidencePath,
 	sha256,
@@ -35,6 +37,9 @@ import {
 import type {
 	ActionAuthority,
 	AuditDecision,
+	AuditFailureGap,
+	AuditRejectionDiagnostic,
+	AuditReport,
 	EvaluatorDecision,
 	EvidenceRecord,
 	GoalCriterion,
@@ -48,7 +53,7 @@ import type {
 	VerificationCheck,
 	VerificationResult,
 } from "./types.ts";
-import { showDetailOverlay, showSetupCard, showSetupTranscriptEditor, updateGoalUi } from "./ui.ts";
+import { authorityScopeText, showDetailOverlay, showSetupCard, showSetupTranscriptEditor, updateGoalUi } from "./ui.ts";
 import { runAllChecks, runVerificationCheck } from "./verification.ts";
 
 const GOAL_TOOL_NAMES = new Set([
@@ -75,17 +80,56 @@ export function verificationRecoveryWindow(startedAt: string | undefined, atMs =
 	return { elapsedMs, timedOut: elapsedMs >= maxMs };
 }
 
-export function isExplicitGoalSteeringInput(text: string): boolean {
-	return /^(?:steer|amend|change|revise|update)\s+(?:the\s+)?goal\b|^(?:also|additionally)\s+(?:add|include|require|remove|exclude)\b|^(?:new|changed)\s+requirement\s*:/i.test(text.trim());
+export type GoalInputIntent =
+	| "steering"
+	| "informational"
+	| "neutral_continue"
+	| "pause"
+	| "resume"
+	| "cancel"
+	| "approve_authority_amendment"
+	| "approve_pending_risk"
+	| "generic_approval"
+	| "unknown";
+
+function normalizeControlText(text: string): string {
+	return text.trim().toLowerCase().replace(/[.!]+$/g, "").replace(/\s+/g, " ");
 }
 
-export function isInformationalGoalInput(text: string): boolean {
+function matchesExplicitGoalSteering(text: string): boolean {
+	return /^(?:steer|amend|change|revise|update)\s+(?:the\s+)?goal\b|^(?:also|additionally)\s+(?:add|include|require|remove|exclude|verify|test|check|document)\b|^(?:new|changed)\s+requirement\s*:/i.test(text.trim());
+}
+
+function matchesInformationalGoalInput(text: string): boolean {
 	const normalized = text.trim();
-	if (!normalized || isExplicitGoalSteeringInput(normalized)) return false;
 	return normalized.endsWith("?")
 		|| /^(?:so\b|why|what|how|where|when|who|is|are|am|was|were|do|does|did|have|has|anything)\b/i.test(normalized)
 		|| /^(?:show|explain|summarize)\b.*\b(?:status|progress|goal|recovering|recovery|blocked|verification|audit)\b/i.test(normalized)
 		|| /^(?:status|progress)(?:\s|\?|$)/i.test(normalized);
+}
+
+export function parseGoalInputIntent(text: string): GoalInputIntent {
+	const normalized = normalizeControlText(text);
+	if (!normalized) return "unknown";
+	if (matchesExplicitGoalSteering(text)) return "steering";
+	if (normalized === "approve exact authority amendment") return "approve_authority_amendment";
+	if (normalized === "approve exact pending risk once") return "approve_pending_risk";
+	if (/^approve\b/.test(normalized)) return "generic_approval";
+	if (/^(?:do not|don't|dont|never) (?:cancel|stop|abort|end|terminate)\b/.test(normalized)) return "informational";
+	if (/^pause(?: (?:(?:this|the|my|current|active) )?goal)?$/.test(normalized)) return "pause";
+	if (/^resume(?: (?:(?:this|the|my|current|active) )?goal)?$/.test(normalized)) return "resume";
+	if (/^(?:cancel|stop|abort|end|terminate)(?: (?:(?:this|the|my) )?(?:(?:current|active|stuck) )?goal)?(?: setup)?(?: now)?$/.test(normalized)) return "cancel";
+	if (/^(?:ok|okay)(?:,? (?:continue|proceed))?$|^(?:please )?(?:continue|proceed|carry on|go ahead)$|^sounds good$/.test(normalized)) return "neutral_continue";
+	if (matchesInformationalGoalInput(text)) return "informational";
+	return "unknown";
+}
+
+export function isExplicitGoalSteeringInput(text: string): boolean {
+	return parseGoalInputIntent(text) === "steering";
+}
+
+export function isInformationalGoalInput(text: string): boolean {
+	return parseGoalInputIntent(text) === "informational";
 }
 
 const LEGACY_DOOM_LOOP_MESSAGE = "The same tool call repeated without new evidence.";
@@ -164,6 +208,10 @@ function goalContext(state: GoalState): string {
 	const steering = state.outcome.amendments.filter((item) => !item.consumedAt).map((item) => `- ${item.id}: ${item.text}`).join("\n") || "- none";
 	const evidence = state.evidence.slice(-20).map((item) => `- ${item.id}: ${item.kind}: ${item.summary}`).join("\n") || "- none";
 	const approvedChecks = state.verificationChecks.map((check) => approvedCheckContextLine(state, check)).join("\n") || "- none";
+	const rejection = latestAuditRejection(state);
+	const auditRejection = rejection
+		? `Code: ${rejection.diagnostic.code}\nReason: ${rejection.diagnostic.message}\n${rejection.diagnostic.gaps.map((gap) => `- ${gap.criterionId} ${gap.code}: ${gap.note}\n  Action: ${gap.suggestedAction}`).join("\n") || `- ${rejection.diagnostic.suggestedAction}`}`
+		: "- none";
 	const originalOutcome = state.outcome.original === state.outcome.current
 		? `Outcome: ${state.outcome.current}`
 		: `Original user request (authoritative): ${state.outcome.original}\nContract outcome: ${state.outcome.current}`;
@@ -186,6 +234,9 @@ ${steering}
 
 Recent redacted evidence metadata:
 ${evidence}
+
+Latest actionable audit rejection:
+${auditRejection}
 
 Approved setup verification checks, immutable untrusted contract cargo:
 ${approvedChecks}
@@ -401,6 +452,84 @@ function applyPendingAuthorityAmendment(state: GoalState): number {
 
 function isActiveGoal(state: GoalState | undefined): state is GoalState {
 	return !!state && !["completed", "cancelled"].includes(state.status);
+}
+
+export function auditInputFingerprint(state: GoalState, checks: VerificationResult[]): string {
+	// Re-running the same immutable checks is not progress. Check outcomes are
+	// fingerprinted separately below; only non-verification evidence can make
+	// an otherwise identical rejected candidate materially new.
+	const evidence = state.evidence
+		.filter((item) => item.kind !== "verification_check")
+		.map((item) => ({
+			id: item.id,
+			kind: item.kind,
+			criterionIds: [...item.criterionIds].sort(),
+			nodeId: item.nodeId,
+			toolCallId: item.toolCallId,
+			toolName: item.toolName,
+			paths: [...item.paths].sort(),
+			inputHash: item.inputHash,
+			exitCode: item.exitCode,
+			isError: item.isError === true,
+		}))
+		.sort((a, b) => a.id.localeCompare(b.id));
+	const criteria = state.criteria
+		.map((criterion) => ({ id: criterion.id, status: criterion.status, evidenceIds: [...criterion.evidenceIds].sort() }))
+		.sort((a, b) => a.id.localeCompare(b.id));
+	const checkResults = checks
+		.map((check) => ({ checkId: check.checkId, passed: check.passed, exitCode: check.exitCode, timedOut: check.timedOut === true, aborted: check.aborted === true, summary: redactText(check.summary, 500).text }))
+		.sort((a, b) => a.checkId.localeCompare(b.checkId));
+	return sha256(canonicalJson({ evidence, criteria, checks: checkResults }));
+}
+
+function auditFailureGaps(state: GoalState, audit: Pick<AuditDecision, "reason" | "criterionResults" | "missingCriteria">): AuditFailureGap[] {
+	const knownEvidence = new Set(state.evidence.map((item) => item.id));
+	const results = new Map(audit.criterionResults.map((result) => [result.criterionId, result]));
+	const missing = new Set(audit.missingCriteria);
+	const gaps: AuditFailureGap[] = [];
+	for (const criterion of state.criteria) {
+		const result = results.get(criterion.id);
+		const evidenceIds = (result?.evidenceIds ?? []).filter((id) => knownEvidence.has(id));
+		const status = result?.status ?? "pending";
+		let code: AuditFailureGap["code"] | undefined;
+		if (!result) code = "missing_criterion_result";
+		else if (missing.has(criterion.id)) code = "criterion_missing";
+		else if (status !== "met" && status !== "waived") code = "criterion_unmet";
+		else if (status === "met" && evidenceIds.length === 0) code = "missing_evidence";
+		if (!code) continue;
+		const note = redactText(result?.note || audit.reason, 500).text;
+		const suggestedAction = code === "missing_evidence"
+			? `Record direct auditable evidence for ${criterion.id}: ${criterion.text}`
+			: `Resolve ${criterion.id}: ${criterion.text}${note ? ` — ${note}` : ""}`;
+		gaps.push({ criterionId: criterion.id, criterionText: criterion.text, status, evidenceIds, note, code, suggestedAction: redactText(suggestedAction, 700).text });
+	}
+	return gaps;
+}
+
+function buildAuditRejectionDiagnostic(state: GoalState, audit: Pick<AuditDecision, "reason" | "criterionResults" | "missingCriteria">, checks: VerificationResult[]): AuditRejectionDiagnostic {
+	const gaps = auditFailureGaps(state, audit);
+	const message = redactText(audit.reason, 800).text;
+	const suggestedAction = gaps[0]?.suggestedAction ?? `Review the audit rejection: ${message}`;
+	const fingerprint = sha256(canonicalJson({
+		code: "AUDIT_REJECTED",
+		missingCriteria: [...audit.missingCriteria].sort(),
+		gaps: gaps.map(({ criterionId, status, evidenceIds, code }) => ({ criterionId, status, evidenceIds: [...evidenceIds].sort(), code })),
+	}));
+	return {
+		code: "AUDIT_REJECTED",
+		message,
+		missingCriteria: audit.missingCriteria.map((item) => redactText(item, 300).text),
+		gaps,
+		failedCheckIds: checks.filter((check) => !check.passed).map((check) => check.checkId),
+		suggestedAction: redactText(suggestedAction, 700).text,
+		fingerprint,
+	};
+}
+
+function latestAuditRejection(state: GoalState): { report: AuditReport; diagnostic: AuditRejectionDiagnostic } | undefined {
+	const report = state.auditReports.at(-1);
+	if (!report || report.verdict !== "fail") return undefined;
+	return { report, diagnostic: report.diagnostic ?? buildAuditRejectionDiagnostic(state, report, []) };
 }
 
 export function validateAuditCompletion(state: GoalState, audit: AuditDecision): { valid: boolean; criteria: GoalCriterion[] } {
@@ -661,6 +790,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 
 	async function finishAudit(ctx: ExtensionContext, goalId: string, generation: number, sequence: number): Promise<void> {
 		let snapshot: GoalState | undefined;
+		let inputFingerprint: string | undefined;
 		await mutex.run(() => {
 			const state = load(ctx);
 			if (!state || state.goalId !== goalId || state.generation !== generation || state.continuationSequence !== sequence || shutdown) return;
@@ -686,6 +816,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			snapshot = structuredClone(state);
 		});
 		if (!snapshot) return;
+		inputFingerprint = auditInputFingerprint(snapshot, checks);
 		if (!checks.length || checks.some((result) => !result.passed)) {
 			await mutex.run(() => {
 				const state = load(ctx);
@@ -726,10 +857,20 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			const state = load(ctx);
 			if (!state || state.goalId !== goalId || state.generation !== generation || state.continuationSequence !== sequence) return;
 			const adjudication = validateAuditCompletion(state, audit);
-			state.auditReports.push({ id: makeId("audit"), verdict: adjudication.valid ? "pass" : "fail", reason: redactText(audit.reason, 800).text, criterionResults: audit.criterionResults, missingCriteria: audit.missingCriteria.map((item) => redactText(item, 300).text), createdAt: now() });
+			const diagnostic = adjudication.valid ? undefined : buildAuditRejectionDiagnostic(state, audit, checks);
+			const criterionResults = audit.criterionResults.map((result) => ({
+				criterionId: redactText(result.criterionId, 120).text,
+				status: result.status,
+				evidenceIds: result.evidenceIds.map((id) => redactText(id, 120).text),
+				note: redactText(result.note, 500).text,
+			}));
+			state.auditReports.push({ id: makeId("audit"), verdict: adjudication.valid ? "pass" : "fail", reason: redactText(audit.reason, 800).text, criterionResults, missingCriteria: audit.missingCriteria.map((item) => redactText(item, 300).text), diagnostic, createdAt: now() });
 			if (adjudication.valid) {
 				clearVerificationFailure(state);
 				state.criteria = adjudication.criteria;
+				state.lastRejectedAuditInputFingerprint = undefined;
+				state.lastAuditRejectionFingerprint = undefined;
+				state.auditRejectionRepeatCount = 0;
 				state.status = "completed";
 				state.phase = "done";
 				state.completedAt = now();
@@ -741,14 +882,25 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				updateGoalUi(ctx, undefined);
 			} else {
 				state.auditFailureCount += 1;
+				state.auditRejectionRepeatCount = state.lastAuditRejectionFingerprint === diagnostic!.fingerprint ? state.auditRejectionRepeatCount + 1 : 1;
+				state.lastAuditRejectionFingerprint = diagnostic!.fingerprint;
+				state.lastRejectedAuditInputFingerprint = inputFingerprint;
 				state.status = "running";
 				state.phase = "recovering";
 				state.completionCandidate = false;
 				state.currentAction = "Addressing audit rejection";
-				state.nextAction = audit.missingCriteria[0] ?? audit.reason;
-				if (state.auditFailureCount >= 3) openInterrupt(state, { class: "BLOCKER", message: "Independent audit rejected completion repeatedly.", attempts: state.auditReports.slice(-3).map((item) => item.reason), need: "Evidence or implementation that satisfies the remaining criteria.", recommendation: "Review the missing criterion and decide whether it is achievable as written." });
-				persist(ctx, "audit_rejected", audit.reason);
-				if (state.status === "running") triggerContinuation(state, "The independent auditor rejected completion. Fix the cited gap and resubmit only after new evidence exists.");
+				state.nextAction = diagnostic!.suggestedAction;
+				if (state.auditRejectionRepeatCount >= 2 || state.auditFailureCount >= 3) {
+					openInterrupt(state, {
+						class: "BLOCKER",
+						message: state.auditRejectionRepeatCount >= 2 ? "Independent audit repeated the same actionable rejection after a bounded repair." : "Independent audit rejected completion repeatedly.",
+						attempts: diagnostic!.gaps.map((gap) => `${gap.criterionId} ${gap.code}: ${gap.note}`).slice(-8),
+						need: diagnostic!.suggestedAction,
+						recommendation: "Review the structured audit gap and decide whether to add materially different evidence, amend the goal explicitly, or cancel it.",
+					});
+				}
+				persist(ctx, "audit_rejected", `${diagnostic!.code}: ${diagnostic!.message}`);
+				if (state.status === "running") triggerContinuation(state, `Audit rejection ${diagnostic!.fingerprint.slice(0, 12)}. ${diagnostic!.suggestedAction} Resubmit only after material evidence or check results change.`);
 			}
 		});
 	}
@@ -1132,7 +1284,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				pendingAuthorityAmendment: { authorities, rationale, requestedAt: now(), resumePhase, resumeCurrentAction, resumeNextAction },
 			});
 			persist(ctx, "authority_amendment_requested", rationale);
-			return toolResult("Authority amendment is awaiting exact human approval through bare /goal or the exact approval phrase.");
+			return toolResult(`Authority amendment is awaiting exact human approval through bare /goal or the exact approval phrase. Displayed exact scope:\n${authorities.map(authorityScopeText).join("\n")}`);
 		}),
 	});
 
@@ -1164,7 +1316,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			if (!observations.length || observations.some((item) => !item || item.isError)) throw new Error("No recent unused successful tool observations are available for evidence");
 			const cleaned = redactText(params.summary, 500);
 			const evidence: EvidenceRecord = { id: makeId("evidence"), kind: params.kind === "test_result" ? "test_result" : "tool_result", summary: cleaned.text, criterionIds, nodeId: node?.id, toolCallId: observations.map((item) => item!.toolCallId).join(","), toolName: observations.map((item) => item!.toolName).join(","), paths: [...new Set(observations.flatMap((item) => item!.paths))], isError: false, redacted: cleaned.redacted, createdAt: now() };
-			state.evidence.push(evidence); state.repeatedToolCalls = {}; state.noProgressCount = 0; state.deferredRisk = undefined;
+			state.evidence.push(evidence); reconcileCriterionEvidenceIds(state); state.repeatedToolCalls = {}; state.noProgressCount = 0; state.deferredRisk = undefined;
 			if (state.phase === "recovering" && !state.interrupt && !state.verificationFailureSignature) state.phase = "executing";
 			if (node) {
 				node.evidenceIds.push(evidence.id); node.updatedAt = now();
@@ -1203,6 +1355,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				return old ?? { id: `AC${index + 1}`, text: cleaned, status: "pending", evidenceIds: [] };
 			});
 			state.outcome.current = redactText(params.outcome, 2_000).text; amendment.consumedAt = now(); state.generation += 1; state.completionCandidate = false; state.phase = "planning";
+			state.auditFailureCount = 0; state.lastRejectedAuditInputFingerprint = undefined; state.lastAuditRejectionFingerprint = undefined; state.auditRejectionRepeatCount = 0;
 			persist(ctx, "steering_applied", params.reason); return toolResult(`Applied user steering. Generation ${state.generation}.`);
 		}),
 	});
@@ -1260,6 +1413,24 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 					transitionVerificationFailure(ctx, state, checks, "preflight");
 					return toolResult(`Completion candidate rejected by approved checks. ${checks.find((result) => !result.passed)?.summary ?? "No verification result was produced."}`, { checks });
 				}
+				const inputFingerprint = auditInputFingerprint(state, checks);
+				if (state.lastRejectedAuditInputFingerprint === inputFingerprint) {
+					const rejection = latestAuditRejection(state);
+					state.auditRejectionRepeatCount = Math.max(2, state.auditRejectionRepeatCount + 1);
+					const action = rejection?.diagnostic.suggestedAction ?? "Add materially different evidence before resubmitting completion.";
+					openInterrupt(state, {
+						class: "BLOCKER",
+						message: "Completion was resubmitted unchanged after an actionable audit rejection.",
+						attempts: rejection?.diagnostic.gaps.map((gap) => `${gap.criterionId} ${gap.code}: ${gap.note}`).slice(-8) ?? ["No material evidence or approved-check result changed."],
+						need: action,
+						recommendation: "Review the structured audit gap and add materially different evidence, explicitly steer the goal, or cancel it.",
+					});
+					persist(ctx, "audit_retry_blocked", "unchanged completion candidate matched the last rejected audit input");
+					return toolResult(`Completion candidate blocked: no material evidence or approved-check result changed since the last audit rejection. ${action}`, {
+						code: "UNCHANGED_AUDIT_RETRY",
+						lastAuditRejection: rejection?.diagnostic,
+					});
+				}
 				clearVerificationFailure(state);
 				state.deferredRisk = undefined;
 				state.completionCandidate = true; state.phase = "verifying"; state.currentAction = "Awaiting independent completion audit"; state.nextAction = "Run approved checks";
@@ -1310,6 +1481,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		parameters: Type.Object({}),
 		execute: async (_id, _params, _signal, _update, ctx) => {
 			const state = load(ctx);
+			const rejection = state ? latestAuditRejection(state) : undefined;
 			return toolResult(state ? JSON.stringify({
 				goalId: state.goalId,
 				generation: state.generation,
@@ -1322,6 +1494,12 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				currentAction: state.currentAction,
 				nextAction: state.nextAction,
 				interrupt: state.interrupt?.class,
+				pendingAuthorityAmendment: state.interrupt?.pendingAuthorityAmendment?.authorities.map(authorityScopeText),
+				lastAuditRejection: rejection ? {
+					...rejection.diagnostic,
+					retryable: state.status !== "interrupted" && state.lastRejectedAuditInputFingerprint !== undefined,
+					repeatCount: state.auditRejectionRepeatCount,
+				} : undefined,
 				verificationFailureCount: state.verificationFailureCount,
 				verificationRecoveryStartedAt: state.verificationRecoveryStartedAt,
 			}) : "No goal");
@@ -1398,8 +1576,9 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			if (event.source === "extension" || event.text.trim().startsWith("/goal")) return;
 			const state = load(ctx); if (!state) return;
 			const text = event.text.trim();
+			const intent = parseGoalInputIntent(text);
 			if (state.status === "setting_up") {
-				if (/^(?:cancel goal setup|cancel the goal setup|cancel setup|stop goal setup)$/i.test(text)) {
+				if (intent === "cancel") {
 					state.status = "cancelled";
 					state.phase = "done";
 					state.setupAwaitingUser = false;
@@ -1417,14 +1596,14 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			if (!isActiveGoal(state)) return;
-			if (/^(?:pause|pause goal|pause the goal)$/i.test(text)) {
+			if (intent === "pause") {
 				if (state.status === "running" || state.status === "auditing") {
 					clearVerificationRecoveryTimer();
 					state.status = "paused"; state.continuationSequence += 1; state.lastContinuationKey = undefined; state.currentAction = "Paused by user"; persist(ctx, "goal_paused", "natural-language pause"); abortActive = true;
 				}
 				return { action: "handled" as const };
 			}
-			if (/^(?:resume|resume goal|resume the goal)$/i.test(text)) {
+			if (intent === "resume") {
 				const resumesPaused = state.status === "paused" && !state.interrupt;
 				const resumesNonRiskInterrupt = state.status === "interrupted" && !!state.interrupt && !state.interrupt.pendingAction && !state.interrupt.pendingAuthorityAmendment;
 				if (resumesPaused || resumesNonRiskInterrupt) {
@@ -1434,25 +1613,25 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				else if (state.interrupt?.pendingAuthorityAmendment) ctx.ui.notify("Exact pending authority amendment requires approval or resolution; resume cannot grant authority.", "warning");
 				return { action: "handled" as const };
 			}
-			if (/^(?:cancel|cancel goal|cancel the goal|stop goal|stop the goal)$/i.test(text)) {
+			if (intent === "cancel") {
 				clearVerificationRecoveryTimer();
 				state.status = "cancelled"; state.phase = "done"; state.continuationSequence += 1; state.lastContinuationKey = undefined; persist(ctx, "goal_cancelled", "natural-language cancellation"); updateGoalUi(ctx, undefined); abortActive = true; return { action: "handled" as const };
 			}
-			if (/^approve exact authority amendment$/i.test(text) && state.interrupt?.pendingAuthorityAmendment) {
+			if (intent === "approve_authority_amendment" && state.interrupt?.pendingAuthorityAmendment) {
 				const count = applyPendingAuthorityAmendment(state);
 				persist(ctx, "authority_amendment_approved", `${count} exact typed authorities approved by natural-language phrase`);
 				triggerContinuation(state, "The user approved the displayed typed authority amendment. Continue the same current step without broadening it.");
 				return { action: "handled" as const };
 			}
-			if (/^approve exact pending risk once$/i.test(text) && state.interrupt?.pendingAction) {
+			if (intent === "approve_pending_risk" && state.interrupt?.pendingAction) {
 				const authority = buildRiskAuthority(state); if (authority) state.authorities.push(authority);
 				state.interrupt = undefined; state.status = "running"; state.phase = "recovering"; state.generation += 1; state.continuationSequence += 1; state.lastContinuationKey = undefined; persist(ctx, "risk_approved", "natural-language exact pending-risk approval"); triggerContinuation(state, "Retry only the exact pending action approved by the user."); return { action: "handled" as const };
 			}
-			if (/^approve\b/i.test(text) && (state.interrupt?.pendingAction || state.interrupt?.pendingAuthorityAmendment)) {
+			if (intent === "generic_approval" && (state.interrupt?.pendingAction || state.interrupt?.pendingAuthorityAmendment)) {
 				ctx.ui.notify(state.interrupt?.pendingAuthorityAmendment ? 'Exact approval required: type "approve exact authority amendment" or use bare /goal.' : 'Exact approval required: type "approve exact pending risk once" or use bare /goal.', "warning");
 				return { action: "handled" as const };
 			}
-			if (isInformationalGoalInput(text)) return;
+			if (intent === "informational" || intent === "neutral_continue" || intent === "generic_approval") return;
 			if (state.status === "interrupted" && state.interrupt && !state.interrupt.pendingAction) {
 				const cleaned = redactText(text, 2_000);
 				const explicitSteering = isExplicitGoalSteeringInput(cleaned.text);
@@ -1464,18 +1643,21 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				state.continuationSequence += 1;
 				state.lastContinuationKey = undefined;
 				state.completionCandidate = false;
+				if (explicitSteering) { state.auditFailureCount = 0; state.lastRejectedAuditInputFingerprint = undefined; state.lastAuditRejectionFingerprint = undefined; state.auditRejectionRepeatCount = 0; }
 				state.currentAction = explicitSteering ? "Applying user steering" : "Applying user interruption resolution";
 				state.nextAction = cleaned.text;
 				persist(ctx, "interrupt_resolved", explicitSteering ? "user steering resolved active interruption" : "user supplied interruption resolution");
 				triggerContinuation(state, explicitSteering ? "Apply the user's steering and replan safely." : "Apply the user's interruption resolution and continue safely.");
 				return { action: "handled" as const };
 			}
+			if (intent !== "steering") return;
 			const cleaned = redactText(text, 2_000);
 			const auditWasActive = state.status === "auditing";
 			clearVerificationFailure(state);
+			state.auditFailureCount = 0; state.lastRejectedAuditInputFingerprint = undefined; state.lastAuditRejectionFingerprint = undefined; state.auditRejectionRepeatCount = 0;
 			state.outcome.amendments.push({ id: makeId("steering"), text: cleaned.text, createdAt: now() }); state.generation += 1; state.continuationSequence += 1; state.lastContinuationKey = undefined; state.completionCandidate = false; state.currentAction = "Applying user steering"; state.nextAction = cleaned.text;
 			if (auditWasActive) { state.status = "running"; state.phase = "planning"; abortIsolatedOnly = true; }
-			persist(ctx, "user_steering", auditWasActive ? "explicit user steering invalidated active audit" : "user supplied natural-language steering");
+			persist(ctx, "user_steering", auditWasActive ? "explicit user steering invalidated active audit" : "user supplied explicit steering");
 			if (state.status === "paused" || state.status === "interrupted") return { action: "handled" as const };
 		});
 		if (abortActive) { ctx.abort(); await isolated.abortAll(); }
