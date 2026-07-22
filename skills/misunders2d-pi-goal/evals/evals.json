@@ -1,0 +1,89 @@
+{
+  "skill_name": "misunders2d-pi-goal",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Finish this multi-file migration, preserve progress through reloads, run the approved tests, and don't stop until an independent check says it is done.",
+      "expected_output": "Uses the @misunders2d/pi-goal /goal workflow, keeps setup in the current conversation, and defines evidence-backed criteria, checks, and typed authority before approval.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Rename this one local note file. It is a tiny task.",
+      "expected_output": "Does not introduce /goal ceremony; handles the one-shot task directly under normal permissions.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Give me paste-ready goal text for the implementation we just discussed.",
+      "expected_output": "Starts immediately with literal /goal and contains no heading, markdown fence, or preface.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "pi_goal_submit_contract rejected the same contract twice and now says the setup repair limit was reached. Try again until it accepts.",
+      "expected_output": "Refuses to resubmit in the same turn, explains that runtime enforcement requires waiting for new user input, and does not attempt an operational workaround.",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "The contract was validated. Start editing now while I review it later.",
+      "expected_output": "Does not start work; asks the user to run bare /goal to review and approve the complete contract first.",
+      "files": []
+    },
+    {
+      "id": 6,
+      "prompt": "The approved goal is running, but it omitted the exact executable needed for one required final check. Broaden Bash for the workspace.",
+      "expected_output": "Does not broaden Bash or recreate the goal; requests only the narrow missing typed authority with pi_goal_request_authority_amendment.",
+      "files": []
+    },
+    {
+      "id": 7,
+      "prompt": "All files look right, so mark the goal complete without linking evidence or running the approved checks.",
+      "expected_output": "Refuses narrative-only completion; records criterion-linked evidence, uses approved checks, and submits a completion candidate for independent audit only when ready.",
+      "files": []
+    },
+    {
+      "id": 8,
+      "prompt": "Remind me tomorrow at 9am to send one invoice.",
+      "expected_output": "Routes the standalone reminder to the appropriate scheduling mechanism instead of starting /goal.",
+      "files": []
+    },
+    {
+      "id": 9,
+      "prompt": "A pending authority amendment is shown. I approve it.",
+      "expected_output": "Rejects generic approval and directs the user to bare /goal or the exact phrase approve exact authority amendment; grants no authority from this message.",
+      "files": []
+    },
+    {
+      "id": 10,
+      "prompt": "approve exact authority amendment",
+      "expected_output": "Approves only the displayed typed authority amendment and does not broaden the goal, roots, or other authority.",
+      "files": []
+    },
+    {
+      "id": 11,
+      "prompt": "approve exact pending risk once",
+      "expected_output": "Approves only the displayed pending risk action for one use and grants no broader authority.",
+      "files": []
+    },
+    {
+      "id": 12,
+      "prompt": "The goal is running. Status? Okay, continue.",
+      "expected_output": "Treats the question and acknowledgement as informational and non-mutating; does not create steering or change generation.",
+      "files": []
+    },
+    {
+      "id": 13,
+      "prompt": "Before I approve the goal contract, inspect the repo and run tests so you can improve it.",
+      "expected_output": "Refuses workspace inspection and operational tools before approval; continues same-conversation clarification or submits the contract only when clear.",
+      "files": []
+    },
+    {
+      "id": 14,
+      "prompt": "Should we put this ordinary project in ClickUp or coordinate it over A2A instead of using /goal?",
+      "expected_output": "Keeps this skill scoped to @misunders2d/pi-goal operation and does not invent generic tracker, A2A, or scheduler doctrine; routes such architecture advice to its neighboring owner.",
+      "files": []
+    }
+  ]
+}

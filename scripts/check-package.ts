@@ -10,8 +10,12 @@ assert.equal(manifest.name, "@misunders2d/pi-goal");
 assert.equal(manifest.license, "MIT");
 assert.ok(manifest.keywords.includes("pi-package"), "pi-package keyword is required for pi.dev discoverability");
 assert.deepEqual(manifest.pi.extensions, ["./src/index.ts"]);
+assert.deepEqual(manifest.pi.skills, ["./skills"]);
 assert.match(manifest.pi.image, /^https:\/\/raw\.githubusercontent\.com\/misunders2d\/pi-goal\/main\/media\/.+\.png$/);
 assert.ok(existsSync(resolve(root, "media/pi-goal-preview.png")), "gallery preview image must exist before release");
+const skillPath = "skills/misunders2d-pi-goal/SKILL.md";
+const skill = readFileSync(resolve(root, skillPath), "utf8");
+assert.match(skill, /^---\nname: misunders2d-pi-goal\n/);
 assert.equal(manifest.publishConfig.access, "public");
 for (const dependency of ["@earendil-works/pi-agent-core", "@earendil-works/pi-ai", "@earendil-works/pi-coding-agent", "@earendil-works/pi-tui", "typebox"]) {
 	assert.equal(manifest.peerDependencies[dependency], "*", `${dependency} must be an unbundled Pi peer dependency`);
@@ -28,5 +32,6 @@ const files = pack.files.map((entry: { path: string }) => entry.path);
 for (const forbidden of [/^node_modules\//, /^\.git\//, /(?:^|\/)state\.json$/, /events\.jsonl$/, /evidence\.json$/, /auth\.json$/, /\.env(?:\.|$)/]) {
 	assert.equal(files.some((path: string) => forbidden.test(path)), false, `tarball contains forbidden path matching ${forbidden}`);
 }
-for (const required of ["package.json", "README.md", "LICENSE", "src/index.ts", "media/pi-goal-preview.png"]) assert.ok(files.includes(required), `tarball missing ${required}`);
+for (const required of ["package.json", "README.md", "LICENSE", "src/index.ts", skillPath, "skills/misunders2d-pi-goal/evals/evals.json", "media/pi-goal-preview.png"]) assert.ok(files.includes(required), `tarball missing ${required}`);
+assert.deepEqual(files.filter((path: string) => /^skills\/.*\/SKILL\.md$/.test(path)), [skillPath], "tarball must contain exactly one operator skill");
 console.log(`package metadata valid; ${files.length} files; unpacked ${pack.unpackedSize} bytes`);

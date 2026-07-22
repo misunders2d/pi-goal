@@ -269,6 +269,19 @@ export interface AuditReport {
 	createdAt: string;
 }
 
+export type SetupSubmissionStage = "draft" | "authority_tools" | "command_authority" | "goal_state";
+
+export interface SetupSubmissionDiagnostic {
+	code: "SETUP_CONTRACT_VALIDATION_FAILED";
+	stage: SetupSubmissionStage;
+	message: string;
+	fingerprint: string;
+	attemptCount: number;
+	repeatCount: number;
+	suggestedAction: string;
+	createdAt: string;
+}
+
 export interface GoalState {
 	schemaVersion: typeof GOAL_SCHEMA_VERSION;
 	goalId: string;
@@ -326,6 +339,10 @@ export interface GoalState {
 	activeToolCalls: Record<string, { toolName: string; startedAt: string }>;
 	backgroundWork: Record<string, BackgroundWork>;
 	setupAwaitingUser?: boolean;
+	setupSubmissionFailureCount: number;
+	lastSetupSubmissionFailureFingerprint?: string;
+	setupSubmissionFailureRepeatCount: number;
+	setupSubmissionDiagnostic?: SetupSubmissionDiagnostic;
 }
 
 export interface GoalDraft {

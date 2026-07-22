@@ -64,6 +64,10 @@ test("schema-1 normalization preserves legacy blocker counters and defaults new 
 	delete raw.auditExecutionRepeatCount;
 	delete raw.workspaceRoots;
 	delete raw.lastRejectedAuditInputFingerprint;
+	delete raw.setupSubmissionFailureCount;
+	delete raw.setupSubmissionFailureRepeatCount;
+	delete raw.lastSetupSubmissionFailureFingerprint;
+	delete raw.setupSubmissionDiagnostic;
 	delete raw.plan[0].commands;
 	const restored = normalizeState(raw)!;
 	assert.deepEqual(restored.repeatedBlockers, { legacy: 2 });
@@ -71,9 +75,24 @@ test("schema-1 normalization preserves legacy blocker counters and defaults new 
 	assert.equal(restored.auditRejectionRepeatCount, 0);
 	assert.equal(restored.auditExecutionRepeatCount, 0);
 	assert.deepEqual(restored.workspaceRoots, ["/tmp/work"]);
+	assert.equal(restored.setupSubmissionFailureCount, 0);
+	assert.equal(restored.setupSubmissionFailureRepeatCount, 0);
+	assert.equal(restored.lastSetupSubmissionFailureFingerprint, undefined);
+	assert.equal(restored.setupSubmissionDiagnostic, undefined);
 	assert.deepEqual(restored.plan[0].commands, []);
 	delete raw.repeatedBlockers;
 	assert.deepEqual(normalizeState(raw)!.repeatedBlockers, {});
+});
+
+test("schema-1 normalization restores capped setup as awaiting user", () => {
+	const raw: any = createGoalState(draft, fakeContext("/tmp/work"));
+	raw.status = "setting_up";
+	raw.phase = "setup";
+	raw.setupAwaitingUser = false;
+	raw.setupSubmissionFailureCount = 2;
+	raw.setupSubmissionFailureRepeatCount = 2;
+	const restored = normalizeState(raw)!;
+	assert.equal(restored.setupAwaitingUser, true);
 });
 
 test("schema-1 normalization rebuilds criterion evidence links from canonical evidence", () => {

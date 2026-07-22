@@ -274,6 +274,140 @@ test("invalid contract fails closed while normal transcript remains the setup re
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("setup contract submission stops on a repeated equivalent failure", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-setup-repeat-cap-"));
+	try {
+		const harness = makeHarness(root);
+		await harness.command("goal", "Bound contract repair attempts");
+		const setup = latestState(harness);
+		const fakeSecret = "npm_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
+		const invalid = {
+			goalId: setup.goalId,
+			generation: setup.generation,
+			outcome: "bad",
+			criteria: [`Complete after auditor confirms pass ${fakeSecret}`],
+			phases: [{ id: "P1", title: "work" }],
+			verificationChecks: [{ id: "V1", kind: "file_exists", label: "manifest", path: "package.json" }],
+			authorities: [], constraints: [], nonGoals: [],
+		};
+		await assert.rejects(() => harness.tool("pi_goal_submit_contract", invalid), /process-only audit criteria/);
+		let state = latestState(harness);
+		assert.equal(state.setupSubmissionFailureCount, 1);
+		assert.equal(state.setupSubmissionFailureRepeatCount, 1);
+		assert.equal(state.setupSubmissionDiagnostic.stage, "draft");
+		assert.doesNotMatch(state.setupSubmissionDiagnostic.message, new RegExp(fakeSecret));
+		assert.match(state.setupSubmissionDiagnostic.message, /\[REDACTED\]/);
+		assert.equal(state.setupAwaitingUser, false);
+		assert.equal(harness.aborts, 0);
+		const context = (await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "x" })).find(Boolean);
+		assert.match(JSON.stringify(context), /Last contract rejection/);
+		assert.doesNotMatch(JSON.stringify(context), new RegExp(fakeSecret));
+
+		await assert.rejects(() => harness.tool("pi_goal_submit_contract", invalid), /setup contract repair limit reached/i);
+		state = latestState(harness);
+		assert.equal(state.setupSubmissionFailureCount, 2);
+		assert.equal(state.setupSubmissionFailureRepeatCount, 2);
+		assert.equal(state.setupAwaitingUser, true);
+		assert.equal(harness.aborts, 1);
+		const cappedCount = state.setupSubmissionFailureCount;
+		await assert.rejects(() => harness.tool("pi_goal_submit_contract", invalid), /waiting for new user input/i);
+		assert.equal(latestState(harness).setupSubmissionFailureCount, cappedCount);
+		assert.equal(harness.aborts, 1);
+		const statePath = goalArtifact(root, "state.json");
+		const crashWindowState = JSON.parse(readFileSync(statePath, "utf8"));
+		crashWindowState.setupAwaitingUser = false;
+		writeFileSync(statePath, `${JSON.stringify(crashWindowState, null, 2)}\n`);
+		const reloaded = makeHarness(root);
+		await reloaded.emit("session_start", { type: "session_start", reason: "reload" });
+		const restoredStatus = JSON.parse((await reloaded.tool("pi_goal_status", {})).content[0].text);
+		assert.equal(restoredStatus.setupSubmission.failureCount, 2);
+		assert.equal(restoredStatus.setupSubmission.blocked, true);
+		await assert.rejects(() => reloaded.tool("pi_goal_submit_contract", invalid), /waiting for new user input/i);
+		assert.equal(reloaded.aborts, 0);
+		assert.doesNotMatch(readFileSync(goalArtifact(root, "events.jsonl"), "utf8"), new RegExp(fakeSecret));
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("setup contract submission stops after three distinct validation failures", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-setup-distinct-cap-"));
+	try {
+		const harness = makeHarness(root);
+		await harness.command("goal", "Bound distinct contract failures");
+		const setup = latestState(harness);
+		await assert.rejects(() => harness.tool("pi_goal_submit_contract", {
+			goalId: setup.goalId, generation: setup.generation, outcome: "bad", criteria: ["done"], phases: [{ id: "P1", title: "work" }], verificationChecks: [{ id: "V1", kind: "file_exists", label: "outside", path: join(tmpdir(), "outside-approved-goal-root") }], authorities: [], constraints: [], nonGoals: [],
+		}), /verification path leaves the approved workspace/);
+		assert.equal(latestState(harness).setupSubmissionDiagnostic.stage, "draft");
+		await assert.rejects(() => harness.tool("pi_goal_submit_contract", {
+			goalId: setup.goalId, generation: setup.generation, ...draft,
+			authorities: [{ id: "A1", label: "Unavailable", actionClass: "external_write", toolName: "functions.not_registered", targets: [], maxUses: 1 }],
+		}), /unavailable operational tool/);
+		assert.equal(latestState(harness).setupSubmissionDiagnostic.stage, "authority_tools");
+		await assert.rejects(() => harness.tool("pi_goal_submit_contract", {
+			goalId: setup.goalId, generation: setup.generation, ...draft,
+			phases: [{ id: "P1", title: "work", commands: [{ executable: "node", args: ["--version"], cwd: harness.ctx.cwd, actionClasses: ["local_process"] }], criterionIds: ["AC1"] }],
+		}), /setup contract repair limit reached/i);
+		const state = latestState(harness);
+		assert.equal(state.setupSubmissionFailureCount, 3);
+		assert.equal(state.setupSubmissionFailureRepeatCount, 1);
+		assert.equal(state.setupSubmissionDiagnostic.stage, "command_authority");
+		assert.equal(state.setupAwaitingUser, true);
+		assert.equal(harness.aborts, 1);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("new setup input resets the submission budget while reload does not", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-setup-reset-"));
+	try {
+		const harness = makeHarness(root);
+		await harness.command("goal", "Reset only after user input");
+		const setup = latestState(harness);
+		const invalid = { goalId: setup.goalId, generation: setup.generation, outcome: "bad", criteria: ["done"], phases: [{ id: "P1", title: "work" }], verificationChecks: [], authorities: [], constraints: [], nonGoals: [] };
+		await assert.rejects(() => harness.tool("pi_goal_submit_contract", invalid));
+		await assert.rejects(() => harness.tool("pi_goal_submit_contract", invalid));
+		const capped = latestState(harness);
+		assert.equal(capped.setupAwaitingUser, true);
+		await harness.emit("session_start", { type: "session_start", reason: "reload" });
+		assert.equal(latestState(harness).setupSubmissionFailureCount, 2);
+		assert.equal(latestState(harness).setupAwaitingUser, true);
+		harness.messages.length = 0;
+		await harness.emit("session_compact", { type: "session_compact", willRetry: false });
+		assert.equal(latestState(harness).setupSubmissionFailureCount, 2);
+		assert.equal(latestState(harness).setupAwaitingUser, true);
+		assert.equal(harness.messages.length, 0);
+		await harness.emit("input", { type: "input", source: "interactive", text: "Use one simple file check" });
+		let state = latestState(harness);
+		assert.equal(state.setupSubmissionFailureCount, 0);
+		assert.equal(state.setupSubmissionFailureRepeatCount, 0);
+		assert.equal(state.setupSubmissionDiagnostic, undefined);
+		assert.equal(state.setupAwaitingUser, false);
+		assert.equal(state.currentAction, "Clarifying goal in this conversation");
+		await assert.rejects(() => harness.tool("pi_goal_submit_contract", invalid));
+		state = latestState(harness);
+		assert.equal(state.setupSubmissionFailureCount, 1);
+		assert.equal(state.setupAwaitingUser, false);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("valid setup replacement clears prior submission diagnostics and status exposes bounded failures", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-setup-success-clear-"));
+	try {
+		const harness = makeHarness(root);
+		await harness.command("goal", "Recover to a valid contract");
+		const setup = latestState(harness);
+		await assert.rejects(() => harness.tool("pi_goal_submit_contract", { goalId: setup.goalId, generation: setup.generation, outcome: "bad", criteria: ["done"], phases: [{ id: "P1", title: "work" }], verificationChecks: [], authorities: [], constraints: [], nonGoals: [] }));
+		const status = JSON.parse((await harness.tool("pi_goal_status", {})).content[0].text);
+		assert.equal(status.setupSubmission.failureCount, 1);
+		assert.equal(status.setupSubmission.blocked, false);
+		await harness.tool("pi_goal_submit_contract", { goalId: setup.goalId, generation: setup.generation, ...draft });
+		const state = latestState(harness);
+		assert.equal(state.status, "awaiting_approval");
+		assert.equal(state.setupSubmissionFailureCount, 0);
+		assert.equal(state.setupSubmissionFailureRepeatCount, 0);
+		assert.equal(state.setupSubmissionDiagnostic, undefined);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("restores running state, injects it every turn, and blocks out-of-workspace mutation", async () => {
 	const root = mkdtempSync(join(tmpdir(), "pi-goal-integration-"));
 	try {
@@ -1171,6 +1305,64 @@ test("three distinct evidenced denials plus replan permit BLOCKER interruption",
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("explicit steering invalidates deferred and pending RISK actions", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-risk-steering-"));
+	try {
+		const harness = makeHarness(root);
+		const initial = injectRunning(harness);
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		const firstInput = { record: "first" };
+		await harness.emit("tool_call", { type: "tool_call", toolName: "records_create", toolCallId: "risk-old-1", input: firstInput });
+		assert.ok(latestState(harness).deferredRisk);
+		await harness.emit("input", { type: "input", source: "interactive", text: "Change the goal to exclude the external record" });
+		let state = latestState(harness);
+		assert.equal(state.deferredRisk, undefined);
+		await assert.rejects(() => harness.tool("pi_goal_request_interrupt", { goalId: state.goalId, generation: state.generation, class: "RISK", message: "Old action", attempts: [], need: "Old action", recommendation: "Approve" }), /previously blocked/);
+		const amendment = state.outcome.amendments.at(-1);
+		await harness.emit("tool_call", { type: "tool_call", toolName: "records_create", toolCallId: "risk-before-apply", input: { record: "apply" } });
+		assert.ok(latestState(harness).deferredRisk);
+		await harness.tool("pi_goal_apply_steering", { goalId: state.goalId, generation: state.generation, amendmentId: amendment.id, outcome: state.outcome.current, criteria: state.criteria.map((criterion: any) => criterion.text), reason: "Apply explicit steering" });
+		state = latestState(harness);
+		assert.equal(state.deferredRisk, undefined);
+
+		const secondInput = { record: "second" };
+		await harness.emit("tool_call", { type: "tool_call", toolName: "records_create", toolCallId: "risk-old-2", input: secondInput });
+		await harness.emit("tool_call", { type: "tool_call", toolName: "read", toolCallId: "risk-safe", input: { path: "README.md" } });
+		await harness.emit("tool_result", { type: "tool_result", toolName: "read", toolCallId: "risk-safe", input: { path: "README.md" }, isError: false, content: [], details: {} });
+		state = latestState(harness);
+		await harness.tool("pi_goal_request_interrupt", { goalId: state.goalId, generation: state.generation, class: "RISK", message: "Second action", attempts: ["Read local alternative"], need: "Second action", recommendation: "Approve" });
+		assert.ok(latestState(harness).interrupt?.pendingAction);
+		await harness.emit("input", { type: "input", source: "interactive", text: "Change the goal to remove the second external action" });
+		state = latestState(harness);
+		assert.equal(state.status, "running");
+		assert.equal(state.interrupt, undefined);
+		assert.equal(state.deferredRisk, undefined);
+		await harness.emit("input", { type: "input", source: "interactive", text: "approve exact pending risk once" });
+		assert.equal(latestState(harness).authorities.length, 0);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("detail-overlay explicit steering invalidates stale deferred RISK", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-risk-detail-steering-"));
+	try {
+		const harness = makeHarness(root);
+		const state = createGoalState(draft, harness.ctx);
+		state.status = "interrupted";
+		state.phase = "blocked";
+		state.interrupt = { class: "DECISION", message: "Choose direction", attempts: [], need: "Direction", recommendation: "Resolve", signature: "decision", createdAt: new Date().toISOString() };
+		state.deferredRisk = { toolName: "records_create", inputHash: "stale", label: "stale external action", actionClass: "external_write", denials: 1, alternativeToolCallIds: [], createdAt: new Date().toISOString() };
+		harness.branch.push({ type: "custom", customType: STATE_CUSTOM_TYPE, data: state });
+		harness.ctx.ui.custom = async () => "resolve";
+		harness.ctx.ui.editor = async () => "Change the goal to remove all external writes";
+		await harness.command("goal", "");
+		const resolved = latestState(harness);
+		assert.equal(resolved.status, "running");
+		assert.equal(resolved.phase, "planning");
+		assert.equal(resolved.interrupt, undefined);
+		assert.equal(resolved.deferredRisk, undefined);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("pending RISK requires exact phrase and consumes matching authority before execution", async () => {
 	const root = mkdtempSync(join(tmpdir(), "pi-goal-risk-"));
 	try {
@@ -1218,6 +1410,31 @@ test("background event completion, reload, and manual compaction queue fresh con
 		harness.messages.length = 0;
 		await harness.emit("session_compact", { type: "session_compact", willRetry: true });
 		assert.equal(harness.messages.length, 0);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("background event subscriptions recover after session shutdown and restart", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-background-restart-"));
+	try {
+		const harness = makeHarness(root);
+		injectRunning(harness);
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		await harness.emit("session_shutdown", { type: "session_shutdown" });
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		harness.messages.length = 0;
+		harness.pi.events.emit("pi-goal:background-start", { id: "job-restarted", label: "Restarted job", toolName: "job_start" });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(latestState(harness).backgroundWork["job-restarted"].label, "Restarted job");
+		harness.pi.events.emit("pi-goal:background-end", { id: "job-restarted" });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(latestState(harness).backgroundWork["job-restarted"], undefined);
+		assert.match(JSON.stringify(harness.messages.at(-1)), /background work completed/);
+		await harness.emit("session_shutdown", { type: "session_shutdown" });
+		await harness.emit("session_start", { type: "session_start", reason: "resume" });
+		harness.pi.events.emit("pi-goal:background-start", { id: "job-second-cycle", label: "Second cycle", toolName: "job_start" });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		const starts = readFileSync(goalArtifact(root, "events.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line)).filter((event) => event.type === "background_started" && event.summary.includes("job-second-cycle"));
+		assert.equal(starts.length, 1);
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 

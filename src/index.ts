@@ -21,6 +21,8 @@ import {
 	CONTEXT_CUSTOM_TYPE,
 	SETUP_TRANSCRIPT_CUSTOM_TYPE,
 	GoalStore,
+	MAX_IDENTICAL_SETUP_SUBMISSION_FAILURES,
+	MAX_SETUP_SUBMISSION_FAILURES,
 	createGoalSetupState,
 	createGoalState,
 	canonicalJson,
@@ -52,6 +54,7 @@ import type {
 	GoalState,
 	RecoveryEvidence,
 	InterruptClass,
+	SetupSubmissionStage,
 	VerificationCheck,
 	VerificationResult,
 } from "./types.ts";
@@ -279,12 +282,15 @@ function setupContext(state: GoalState): string {
 	const existingContract = state.criteria.length
 		? `\nCurrent proposed contract being refined:\nOutcome: ${state.outcome.current}\nCriteria:\n${state.criteria.map((criterion) => `- ${criterion.id}: ${criterion.text}`).join("\n")}\nPlan:\n${state.plan.map((node) => `- ${node.id}: ${node.title}`).join("\n")}\nAuthorities:\n${state.authorities.map((authority) => `- ${authority.toolName}: ${authority.label} (${authority.maxUses} uses)`).join("\n") || "- none"}\nConstraints:\n${state.constraints.map((item) => `- ${item}`).join("\n") || "- none"}\nNon-goals:\n${state.nonGoals.map((item) => `- ${item}`).join("\n") || "- none"}\n`
 		: "";
+	const diagnostic = state.setupSubmissionDiagnostic
+		? `\nLast contract rejection:\n- Stage: ${state.setupSubmissionDiagnostic.stage}\n- Problem: ${state.setupSubmissionDiagnostic.message}\n- Failed submissions for this user reply: ${state.setupSubmissionFailureCount}\n- Equivalent repeats: ${state.setupSubmissionFailureRepeatCount}\n- Next: ${state.setupSubmissionDiagnostic.suggestedAction}\n${state.setupAwaitingUser ? "- STOP: do not submit another contract until the user provides new input.\n" : ""}`
+		: "";
 	return `GOAL SETUP ACTIVE IN THIS SAME CONVERSATION
 Goal ID: ${state.goalId}
 Setup generation: ${state.generation}
 Original /goal request (authoritative, complete):
 ${state.outcome.original}
-${existingContract}
+${existingContract}${diagnostic}
 Rules:
 - Use this existing conversation normally. Resolve references from prior discussion. Ask concise follow-up questions only when a material requirement remains unclear; do not repeat answered questions and do not impose an arbitrary question limit.
 - Debate conflicting requirements with the user here. Do not inspect or modify workspace, run commands, browse, send, or use other operational tools before contract approval.
@@ -612,6 +618,8 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 	let evaluatorInFlight = false;
 	let shutdown = false;
 	let verificationRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
+	let unsubscribeBackgroundStart: (() => void) | undefined;
+	let unsubscribeBackgroundEnd: (() => void) | undefined;
 
 	function refreshToolInfo(): void {
 		toolInfo.clear();
@@ -626,6 +634,77 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			if (!resolved || resolved.startsWith("pi_goal_")) throw new Error(`contract authority references unavailable operational tool: ${raw}`);
 			authority.toolName = resolved;
 		}
+	}
+
+	function resetSetupSubmissionTracking(state: GoalState): void {
+		state.setupSubmissionFailureCount = 0;
+		state.setupSubmissionFailureRepeatCount = 0;
+		state.lastSetupSubmissionFailureFingerprint = undefined;
+		state.setupSubmissionDiagnostic = undefined;
+	}
+
+	function restoreSetupActions(state: GoalState): void {
+		if (state.criteria.length) {
+			state.currentAction = "Discussing contract refinement in this conversation";
+			state.nextAction = "Ask what should change, then submit a replacement contract";
+		} else {
+			state.currentAction = "Clarifying goal in this conversation";
+			state.nextAction = "Ask only necessary questions, then submit a complete contract";
+		}
+	}
+
+	function setupSubmissionBlocked(state: GoalState): boolean {
+		return state.setupSubmissionFailureCount >= MAX_SETUP_SUBMISSION_FAILURES
+			|| state.setupSubmissionFailureRepeatCount >= MAX_IDENTICAL_SETUP_SUBMISSION_FAILURES;
+	}
+
+	function setupFailureSuggestedAction(stage: SetupSubmissionStage): string {
+		switch (stage) {
+			case "authority_tools": return "Use only currently available operational tool names, then submit one complete corrected contract.";
+			case "command_authority": return "Align every declared command with exact executable authority, argv policy, cwd, and action classes, then submit one complete corrected contract.";
+			case "goal_state": return "Repair the reported goal-state or dependency error, then submit one complete corrected contract.";
+			default: return "Repair the reported contract, workspace-root, or mechanical-check error, then submit one complete corrected contract.";
+		}
+	}
+
+	function failSetupSubmission(ctx: ExtensionContext, state: GoalState, stage: SetupSubmissionStage, error: unknown): never {
+		const safeMessage = redactText(error instanceof Error ? error.message : String(error), 500).text;
+		const fingerprint = sha256(`${stage}\n${safeMessage}`);
+		state.setupSubmissionFailureCount += 1;
+		state.setupSubmissionFailureRepeatCount = state.lastSetupSubmissionFailureFingerprint === fingerprint
+			? state.setupSubmissionFailureRepeatCount + 1
+			: 1;
+		state.lastSetupSubmissionFailureFingerprint = fingerprint;
+		const suggestedAction = setupFailureSuggestedAction(stage);
+		state.setupSubmissionDiagnostic = {
+			code: "SETUP_CONTRACT_VALIDATION_FAILED",
+			stage,
+			message: safeMessage,
+			fingerprint,
+			attemptCount: state.setupSubmissionFailureCount,
+			repeatCount: state.setupSubmissionFailureRepeatCount,
+			suggestedAction,
+			createdAt: now(),
+		};
+		const capped = setupSubmissionBlocked(state);
+		if (capped) {
+			state.setupAwaitingUser = true;
+			state.continuationSequence += 1;
+			state.lastContinuationKey = undefined;
+			state.currentAction = "Waiting for user clarification before another contract submission";
+			state.nextAction = "Wait for new user input; do not submit another contract in this turn";
+		} else {
+			state.currentAction = "Repairing rejected goal contract in this conversation";
+			state.nextAction = suggestedAction;
+		}
+		persist(ctx, capped ? "setup_contract_submission_capped" : "setup_contract_submission_failed", capped
+			? `paused after ${state.setupSubmissionFailureCount} failed submissions; equivalent repeat count ${state.setupSubmissionFailureRepeatCount}`
+			: `${stage}: ${safeMessage}`);
+		if (capped) {
+			ctx.abort();
+			throw new Error("Goal setup contract repair limit reached. Stop this turn and wait for new user input before submitting another contract.");
+		}
+		throw new Error(safeMessage);
 	}
 
 	function load(ctx: ExtensionContext): GoalState | undefined {
@@ -1085,6 +1164,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				const explicitSteering = isExplicitGoalSteeringInput(cleaned.text);
 				state.outcome.amendments.push({ id: makeId("steering"), text: cleaned.text, createdAt: now(), ...(!explicitSteering ? { consumedAt: now() } : {}) });
 				state.interrupt = undefined; state.status = "running"; state.phase = explicitSteering ? "planning" : "recovering"; state.generation += 1; state.continuationSequence += 1;
+				if (explicitSteering) state.deferredRisk = undefined;
 				state.currentAction = "Applying user resolution"; state.nextAction = cleaned.text;
 				persist(ctx, "interrupt_resolved", "user supplied interruption resolution");
 				triggerContinuation(state, "Apply the user's interruption resolution and continue safely.");
@@ -1125,6 +1205,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 					state.continuationSequence += 1;
 					state.lastContinuationKey = undefined;
 					state.setupAwaitingUser = false;
+					resetSetupSubmissionTracking(state);
 					state.currentAction = "Discussing contract refinement in this conversation";
 					state.nextAction = "Ask what should change, then submit a replacement contract";
 					persist(ctx, "setup_refinement_requested", "user returned contract to same-conversation setup");
@@ -1250,12 +1331,31 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			const state = load(ctx);
 			if (!state || state.status !== "setting_up") throw new Error("No goal setup is awaiting a contract");
 			validGeneration(state, params.goalId, params.generation);
-			const draft = normalizeDraft(params, state.outcome.original, ctx.cwd);
-			draft.workspaceRoots = normalizeWorkspaceRoots(ctx.cwd, draft.workspaceRoots);
-			normalizeAuthorityToolNames(draft);
-			const commandAuthorityErrors = validateDraftCommandAuthorities(draft, ctx.cwd, draft.workspaceRoots);
-			if (commandAuthorityErrors.length) throw new Error(`Contract executable authority is incomplete: ${commandAuthorityErrors.join("; ")}`);
-			const replacement = createGoalState(draft, ctx, state.outcome.original);
+			if (setupSubmissionBlocked(state)) throw new Error("Goal setup is waiting for new user input after repeated contract failures; do not submit another contract yet.");
+			let draft: GoalDraft;
+			try {
+				draft = normalizeDraft(params, state.outcome.original, ctx.cwd);
+				draft.workspaceRoots = normalizeWorkspaceRoots(ctx.cwd, draft.workspaceRoots);
+			} catch (error) {
+				return failSetupSubmission(ctx, state, "draft", error);
+			}
+			try {
+				normalizeAuthorityToolNames(draft);
+			} catch (error) {
+				return failSetupSubmission(ctx, state, "authority_tools", error);
+			}
+			try {
+				const commandAuthorityErrors = validateDraftCommandAuthorities(draft, ctx.cwd, draft.workspaceRoots);
+				if (commandAuthorityErrors.length) throw new Error(`Contract executable authority is incomplete: ${commandAuthorityErrors.join("; ")}`);
+			} catch (error) {
+				return failSetupSubmission(ctx, state, "command_authority", error);
+			}
+			let replacement: GoalState;
+			try {
+				replacement = createGoalState(draft, ctx, state.outcome.original);
+			} catch (error) {
+				return failSetupSubmission(ctx, state, "goal_state", error);
+			}
 			replacement.goalId = state.goalId;
 			replacement.createdAt = state.createdAt;
 			replacement.generation = state.generation + 1;
@@ -1390,6 +1490,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			});
 			state.outcome.current = redactText(params.outcome, 2_000).text; amendment.consumedAt = now(); state.generation += 1; state.completionCandidate = false; state.phase = "planning";
 			state.auditFailureCount = 0; state.lastRejectedAuditInputFingerprint = undefined; state.lastAuditRejectionFingerprint = undefined; state.auditRejectionRepeatCount = 0; clearAuditExecutionFailure(state);
+			state.deferredRisk = undefined;
 			persist(ctx, "steering_applied", params.reason); return toolResult(`Applied user steering. Generation ${state.generation}.`);
 		}),
 	});
@@ -1550,6 +1651,13 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				} : undefined,
 				verificationFailureCount: state.verificationFailureCount,
 				verificationRecoveryStartedAt: state.verificationRecoveryStartedAt,
+				setupSubmission: state.status === "setting_up" ? {
+					failureCount: state.setupSubmissionFailureCount,
+					repeatCount: state.setupSubmissionFailureRepeatCount,
+					awaitingUser: state.setupAwaitingUser === true,
+					blocked: setupSubmissionBlocked(state),
+					diagnostic: state.setupSubmissionDiagnostic,
+				} : undefined,
 			}) : "No goal");
 		},
 	});
@@ -1558,6 +1666,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		shutdown = false;
 		refreshToolInfo();
 		const state = load(ctx);
+		subscribeBackgroundEvents();
 		if (state && isLegacyAutomaticDoomLoopInterrupt(state)) {
 			const interruptedAt = Date.parse(state.interrupt!.createdAt);
 			for (const amendment of state.outcome.amendments) {
@@ -1640,7 +1749,9 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 					return { action: "handled" as const };
 				}
 				state.setupAwaitingUser = false;
-				persist(ctx, "setup_user_reply", "user continued same-conversation setup");
+				resetSetupSubmissionTracking(state);
+				restoreSetupActions(state);
+				persist(ctx, "setup_user_reply", "user continued same-conversation setup and reset the bounded contract-submission budget");
 				return;
 			}
 			if (!isActiveGoal(state)) return;
@@ -1673,7 +1784,9 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			}
 			if (intent === "approve_pending_risk" && state.interrupt?.pendingAction) {
 				const authority = buildRiskAuthority(state); if (authority) state.authorities.push(authority);
-				state.interrupt = undefined; state.status = "running"; state.phase = "recovering"; state.generation += 1; state.continuationSequence += 1; state.lastContinuationKey = undefined; persist(ctx, "risk_approved", "natural-language exact pending-risk approval"); triggerContinuation(state, "Retry only the exact pending action approved by the user."); return { action: "handled" as const };
+				state.interrupt = undefined; state.status = "running"; state.phase = "recovering"; state.generation += 1; state.continuationSequence += 1; state.lastContinuationKey = undefined;
+				state.currentAction = "Retrying exact approved action"; state.nextAction = authority?.label ?? "Retry only the exact approved pending action";
+				persist(ctx, "risk_approved", "natural-language exact pending-risk approval"); triggerContinuation(state, "Retry only the exact pending action approved by the user."); return { action: "handled" as const };
 			}
 			if (intent === "generic_approval" && (state.interrupt?.pendingAction || state.interrupt?.pendingAuthorityAmendment)) {
 				ctx.ui.notify(state.interrupt?.pendingAuthorityAmendment ? 'Exact approval required: type "approve exact authority amendment" or use bare /goal.' : 'Exact approval required: type "approve exact pending risk once" or use bare /goal.', "warning");
@@ -1683,6 +1796,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				if (intent !== "steering") return;
 				const cleaned = redactText(text, 2_000);
 				state.interrupt = undefined;
+				state.deferredRisk = undefined;
 				state.status = "running"; state.phase = "planning"; state.generation += 1; state.continuationSequence += 1; state.lastContinuationKey = undefined; state.completionCandidate = false;
 				state.auditFailureCount = 0; state.lastRejectedAuditInputFingerprint = undefined; state.lastAuditRejectionFingerprint = undefined; state.auditRejectionRepeatCount = 0; clearAuditExecutionFailure(state);
 				state.outcome.amendments.push({ id: makeId("steering"), text: cleaned.text, createdAt: now() }); state.currentAction = "Applying user steering"; state.nextAction = cleaned.text;
@@ -1701,7 +1815,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				state.continuationSequence += 1;
 				state.lastContinuationKey = undefined;
 				state.completionCandidate = false;
-				if (explicitSteering) { state.auditFailureCount = 0; state.lastRejectedAuditInputFingerprint = undefined; state.lastAuditRejectionFingerprint = undefined; state.auditRejectionRepeatCount = 0; clearAuditExecutionFailure(state); }
+				if (explicitSteering) { state.deferredRisk = undefined; state.auditFailureCount = 0; state.lastRejectedAuditInputFingerprint = undefined; state.lastAuditRejectionFingerprint = undefined; state.auditRejectionRepeatCount = 0; clearAuditExecutionFailure(state); }
 				state.currentAction = explicitSteering ? "Applying user steering" : "Applying user interruption resolution";
 				state.nextAction = cleaned.text;
 				persist(ctx, "interrupt_resolved", explicitSteering ? "user steering resolved active interruption" : "user supplied interruption resolution");
@@ -1711,6 +1825,9 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			if (intent !== "steering") return;
 			const cleaned = redactText(text, 2_000);
 			const auditWasActive = state.status === "auditing";
+			const pendingRiskWasActive = state.status === "interrupted" && !!state.interrupt?.pendingAction;
+			if (pendingRiskWasActive) { state.interrupt = undefined; state.status = "running"; state.phase = "planning"; }
+			state.deferredRisk = undefined;
 			clearVerificationFailure(state);
 			state.auditFailureCount = 0; state.lastRejectedAuditInputFingerprint = undefined; state.lastAuditRejectionFingerprint = undefined; state.auditRejectionRepeatCount = 0; clearAuditExecutionFailure(state);
 			state.outcome.amendments.push({ id: makeId("steering"), text: cleaned.text, createdAt: now() }); state.generation += 1; state.continuationSequence += 1; state.lastContinuationKey = undefined; state.completionCandidate = false; state.currentAction = "Applying user steering"; state.nextAction = cleaned.text;
@@ -1818,22 +1935,26 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		if (background.id && background.state && TERMINAL_STATES.has(background.state)) markBackgroundTerminal(ctx, state, background.id, background.state);
 	}));
 
-	const unsubscribeBackgroundStart = pi.events.on("pi-goal:background-start", (data) => {
-		void mutex.run(() => {
-			const ctx = currentCtx; const state = store.get();
-			if (!state || !ctx || state.sessionId !== ctx.sessionManager.getSessionId() || state.cwd !== ctx.cwd || !data || typeof data !== "object") return;
-			const item = data as Record<string, unknown>; if (typeof item.id !== "string") return;
-			state.backgroundWork[item.id] = { id: item.id, label: redactText(typeof item.label === "string" ? item.label : "background work", 200).text, toolName: typeof item.toolName === "string" ? item.toolName : undefined, startedAt: now(), updatedAt: now() }; persist(ctx, "background_started", `background job ${item.id} started`);
+	function subscribeBackgroundEvents(): void {
+		if (unsubscribeBackgroundStart || unsubscribeBackgroundEnd) return;
+		unsubscribeBackgroundStart = pi.events.on("pi-goal:background-start", (data) => {
+			void mutex.run(() => {
+				const ctx = currentCtx; const state = store.get();
+				if (!state || !ctx || state.sessionId !== ctx.sessionManager.getSessionId() || state.cwd !== ctx.cwd || !data || typeof data !== "object") return;
+				const item = data as Record<string, unknown>; if (typeof item.id !== "string") return;
+				state.backgroundWork[item.id] = { id: item.id, label: redactText(typeof item.label === "string" ? item.label : "background work", 200).text, toolName: typeof item.toolName === "string" ? item.toolName : undefined, startedAt: now(), updatedAt: now() }; persist(ctx, "background_started", `background job ${item.id} started`);
+			});
 		});
-	});
-	const unsubscribeBackgroundEnd = pi.events.on("pi-goal:background-end", (data) => {
-		void mutex.run(() => {
-			const ctx = currentCtx; const state = store.get();
-			if (!state || !ctx || state.sessionId !== ctx.sessionManager.getSessionId() || state.cwd !== ctx.cwd || !data || typeof data !== "object") return;
-			const item = data as Record<string, unknown>; if (typeof item.id !== "string") return;
-			markBackgroundTerminal(ctx, state, item.id, "event bus ended");
+		unsubscribeBackgroundEnd = pi.events.on("pi-goal:background-end", (data) => {
+			void mutex.run(() => {
+				const ctx = currentCtx; const state = store.get();
+				if (!state || !ctx || state.sessionId !== ctx.sessionManager.getSessionId() || state.cwd !== ctx.cwd || !data || typeof data !== "object") return;
+				const item = data as Record<string, unknown>; if (typeof item.id !== "string") return;
+				markBackgroundTerminal(ctx, state, item.id, "event bus ended");
+			});
 		});
-	});
+	}
+	subscribeBackgroundEvents();
 
 	pi.on("agent_settled", async (_event, ctx) => {
 		let setupSettled = false;
@@ -1863,7 +1984,8 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		const state = load(ctx);
 		if (state) { state.continuationSequence += 1; state.lastContinuationKey = undefined; store.flush(ctx, "session shutdown"); }
 		currentCtx = undefined;
-		unsubscribeBackgroundStart(); unsubscribeBackgroundEnd();
+		unsubscribeBackgroundStart?.(); unsubscribeBackgroundStart = undefined;
+		unsubscribeBackgroundEnd?.(); unsubscribeBackgroundEnd = undefined;
 		await isolated.abortAll();
 	});
 }

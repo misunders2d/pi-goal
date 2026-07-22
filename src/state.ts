@@ -15,6 +15,8 @@ import {
 export const STATE_CUSTOM_TYPE = "pi-goal-state-v1";
 export const CONTEXT_CUSTOM_TYPE = "pi-goal-context-v1";
 export const SETUP_TRANSCRIPT_CUSTOM_TYPE = "pi-goal-setup-transcript-v1";
+export const MAX_SETUP_SUBMISSION_FAILURES = 3;
+export const MAX_IDENTICAL_SETUP_SUBMISSION_FAILURES = 2;
 
 export function now(): string {
 	return new Date().toISOString();
@@ -259,6 +261,8 @@ export function createGoalSetupState(outcome: string, ctx: ExtensionContext): Go
 		activeToolCalls: {},
 		backgroundWork: {},
 		setupAwaitingUser: false,
+		setupSubmissionFailureCount: 0,
+		setupSubmissionFailureRepeatCount: 0,
 	};
 }
 
@@ -328,6 +332,8 @@ export function createGoalState(draft: GoalDraft, ctx: ExtensionContext, origina
 		recoveryEvidence: [],
 		activeToolCalls: {},
 		backgroundWork: {},
+		setupSubmissionFailureCount: 0,
+		setupSubmissionFailureRepeatCount: 0,
 	};
 }
 
@@ -385,6 +391,11 @@ export function normalizeState(raw: unknown): GoalState | undefined {
 	value.noProgressCount = value.noProgressCount ?? 0;
 	value.completionCandidate = !!value.completionCandidate;
 	value.setupAwaitingUser = !!value.setupAwaitingUser;
+	value.setupSubmissionFailureCount = Number.isInteger(value.setupSubmissionFailureCount) ? Math.max(0, value.setupSubmissionFailureCount!) : 0;
+	value.setupSubmissionFailureRepeatCount = Number.isInteger(value.setupSubmissionFailureRepeatCount) ? Math.max(0, value.setupSubmissionFailureRepeatCount!) : 0;
+	if (value.setupSubmissionFailureCount >= MAX_SETUP_SUBMISSION_FAILURES || value.setupSubmissionFailureRepeatCount >= MAX_IDENTICAL_SETUP_SUBMISSION_FAILURES) value.setupAwaitingUser = true;
+	if (typeof value.lastSetupSubmissionFailureFingerprint !== "string") value.lastSetupSubmissionFailureFingerprint = undefined;
+	if (!value.setupSubmissionDiagnostic || typeof value.setupSubmissionDiagnostic !== "object" || typeof value.setupSubmissionDiagnostic.fingerprint !== "string") value.setupSubmissionDiagnostic = undefined;
 	reconcileCriterionEvidenceIds(value as GoalState);
 	return value as GoalState;
 }
