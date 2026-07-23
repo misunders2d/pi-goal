@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { GoalStore, createGoalState, isSensitivePath, isWithinWorkspace, normalizeState, redactText, sha256, validateDag } from "../src/state.ts";
+import { GoalStore, createGoalState, isSensitivePath, isWithinWorkspace, normalizeState, normalizeWorkspaceRoots, redactText, resolvedPathWithinWorkspaces, sha256, validateDag } from "../src/state.ts";
 import type { GoalDraft } from "../src/types.ts";
 
 function fakeContext(cwd: string, branch: any[] = []) {
@@ -38,6 +38,45 @@ test("creates a deterministic complete state shape", () => {
 	assert.equal(state.plan.filter((node) => node.status === "in_progress").length, 1);
 	assert.deepEqual(state.plan[1]?.dependsOn, ["P1"]);
 	assert.equal(state.criteria.length, 2);
+});
+
+test("criterion references accept Cn aliases and reject unknown IDs instead of dropping them", () => {
+	const aliased = createGoalState({ ...draft, phases: [{ id: "P1", title: "Implement", criterionIds: ["C1", "ac2", "C1"] }] }, fakeContext("/tmp/work"));
+	assert.deepEqual(aliased.plan[0].criterionIds, ["AC1", "AC2"]);
+	assert.throws(
+		() => createGoalState({ ...draft, phases: [{ id: "P1", title: "Implement", criterionIds: ["BAD"] }] }, fakeContext("/tmp/work")),
+		/Unknown criterion IDs: BAD.*Valid criteria: AC1, AC2/,
+	);
+});
+
+test("planned roots remain exact and fail closed after symlink substitution", () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-planned-root-"));
+	try {
+		const primary = join(root, "primary"); mkdirSync(primary);
+		const planned = join(root, "planned");
+		assert.deepEqual(normalizeWorkspaceRoots(primary, [planned]), [primary, planned]);
+		assert.equal(resolvedPathWithinWorkspaces(primary, [primary, planned], join(planned, "artifact.txt")), join(planned, "artifact.txt"));
+		const outside = join(root, "outside"); mkdirSync(outside);
+		symlinkSync(outside, planned);
+		assert.equal(resolvedPathWithinWorkspaces(primary, [primary, planned], join(planned, "artifact.txt")), undefined);
+		const raw: any = createGoalState(draft, fakeContext(primary));
+		raw.workspaceRoots = [primary, planned];
+		const restored = normalizeState(raw)!;
+		assert.equal(restored.status, "interrupted");
+		assert.equal(restored.phase, "blocked");
+		assert.deepEqual(restored.workspaceRoots, [primary, "/"]);
+		assert.match(restored.interrupt?.message ?? "", /canonical revalidation/);
+		assert.equal(resolvedPathWithinWorkspaces(primary, restored.workspaceRoots, join(primary, "still-denied.txt")), undefined);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("planned root below a symlinked ancestor is rejected", () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-planned-root-alias-"));
+	try {
+		const primary = join(root, "primary"); const outside = join(root, "outside"); mkdirSync(primary); mkdirSync(outside);
+		const alias = join(root, "alias"); symlinkSync(outside, alias);
+		assert.throws(() => normalizeWorkspaceRoots(primary, [join(alias, "planned")]), /canonical non-symlink path/);
+	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("preserves the complete authoritative user request separately from planner outcome", () => {

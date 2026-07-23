@@ -3,11 +3,11 @@
 This package ships only when the complete product contract is satisfied.
 
 - [x] Durable typed state, atomic mirror, compaction/reload recovery
-- [x] Same-main-conversation clarification and contract debate, durable pre-approval setup state, hard pre-approval operational-tool lock, validated typed contract submission, runtime-enforced setup rejection caps with redacted fingerprints, and one approval card
-- [x] Closed-world typed input intent keeps neutral acknowledgements, clarification, and informational/audit-time questions non-mutating—including while typed authority amendments await approval—while preserving explicit steering; deterministic cancellation grammar rejects negation; one active goal per session
+- [x] Same-main-conversation clarification and contract debate, durable pre-approval setup state, hard pre-approval operational-tool lock, aggregated typed contract diagnostics, material-correction-only setup rejection resets with redacted fingerprints, runtime-enforced caps, and one approval card
+- [x] Closed-world typed input intent keeps neutral acknowledgements, complaints, screenshot paths, and informational/audit-time questions non-mutating—including while typed authority amendments await approval—while preserving explicit steering; `/goal cancel`, panel cancellation, and deterministic aliases cancel immediately while negation does not; one active goal per session
 - [x] Compact widget and responsive detail overlay
 - [x] Package-owned `misunders2d-pi-goal` operator skill with exact lifecycle, bounded setup-repair, evidence, amendment, verification, and audit guidance
-- [x] Typed authority envelope, setup-time executable/check/phase-command projection, composed action classes, quote-aware literal argv parsing, setup-approved canonical multi-root resolved-path/symlink containment, and fail-closed local-process allowlist
+- [x] Typed authority envelope, setup-time executable/check/phase-command projection, deterministic `C<n>`/`AC<n>` mapping with unknown-reference rejection, composed action classes, quote-aware literal argv parsing, setup-approved existing/planned canonical multi-root containment with substitution interruption, secondary-root Git-check cwd, and fail-closed local-process allowlist
 - [x] Full-idle, background-work, stale continuation, and autonomous doom-loop guards that reset after successful calls
 - [x] Canonical criterion-specific metadata-only evidence with secret redaction, atomic criterion-link projection, and schema-1 reconciliation
 - [x] Shared setup/runtime check validation, worker-accessible approved checks with bounded redacted failure diagnostics, completion preflight targets, and exceptional-only bounded recovery

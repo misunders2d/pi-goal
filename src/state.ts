@@ -100,22 +100,26 @@ export function normalizeWorkspaceRoots(cwd: string, requested: unknown = []): s
 		if (lexical === resolve(cwd) || canonicalContextPath(lexical) === primary) continue;
 		if (lexical === "/") throw new Error("filesystem root cannot be approved as a workspace root");
 		if (isSensitivePath(lexical)) throw new Error("sensitive path cannot be approved as a workspace root");
-		let canonical: string;
-		try {
-			if (!statSync(lexical).isDirectory()) throw new Error("workspace root is not a directory");
-			canonical = realpathSync.native(lexical);
-		} catch (error) {
-			throw new Error(`workspace root is unavailable: ${error instanceof Error ? error.message : String(error)}`);
+		let exists = true;
+		try { lstatSync(lexical); }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error(`workspace root is unavailable: ${error instanceof Error ? error.message : String(error)}`);
+			exists = false;
 		}
+		if (exists && !statSync(lexical).isDirectory()) throw new Error("workspace root is not a directory");
+		const canonical = resolvedThroughExistingAncestor(lexical);
+		if (!canonical) throw new Error("workspace root is unavailable through its nearest existing ancestor");
 		if (canonical !== lexical) throw new Error("workspace root must use its canonical non-symlink path");
-		if (!roots.includes(canonical)) roots.push(canonical);
+		if (!roots.includes(lexical)) roots.push(lexical);
 	}
 	if (roots.length > 8) throw new Error("workspace root list exceeds 8 entries");
 	return roots;
 }
 
 export function workspaceRootForCwd(primaryCwd: string, workspaceRoots: string[] | undefined, candidate: string): string | undefined {
-	const roots = normalizeWorkspaceRoots(primaryCwd, workspaceRoots ?? []);
+	let roots: string[];
+	try { roots = normalizeWorkspaceRoots(primaryCwd, workspaceRoots ?? []); }
+	catch { return undefined; }
 	const canonical = canonicalContextPath(candidate);
 	return roots.find((root) => root === canonical);
 }
@@ -143,7 +147,9 @@ function resolvedThroughExistingAncestor(path: string): string | undefined {
 }
 
 export function resolvedPathWithinWorkspaces(cwd: string, workspaceRoots: string[] | undefined, path: string): string | undefined {
-	const roots = normalizeWorkspaceRoots(cwd, workspaceRoots ?? []);
+	let roots: string[];
+	try { roots = normalizeWorkspaceRoots(cwd, workspaceRoots ?? []); }
+	catch { return undefined; }
 	const lexicalTarget = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
 	const eligible = isAbsolute(path)
 		? roots.filter((root) => within(root, lexicalTarget)).sort((a, b) => b.length - a.length)
@@ -204,6 +210,24 @@ export function validateDag(nodes: GoalNode[]): string[] {
 
 function normalizeCheck(check: VerificationCheck, index: number): VerificationCheck {
 	return { ...check, id: check.id?.trim() || `V${index + 1}`, label: check.label?.trim() || `Verification ${index + 1}` };
+}
+
+export function canonicalCriterionIds(ids: string[], validIds: Iterable<string>): string[] {
+	const valid = new Set(validIds);
+	const normalized: string[] = [];
+	const invalid: string[] = [];
+	for (const raw of ids) {
+		const value = raw.trim();
+		const match = /^(?:AC|C)([1-9]\d*)$/i.exec(value);
+		const canonical = match ? `AC${Number(match[1])}` : value;
+		if (!valid.has(canonical)) {
+			if (!invalid.includes(value || "[empty]")) invalid.push(value || "[empty]");
+			continue;
+		}
+		if (!normalized.includes(canonical)) normalized.push(canonical);
+	}
+	if (invalid.length) throw new Error(`Unknown criterion IDs: ${invalid.join(", ")}. Valid criteria: ${[...valid].join(", ")}`);
+	return normalized;
 }
 
 function normalizeAuthority(authority: Omit<ActionAuthority, "uses">, index: number): ActionAuthority {
@@ -282,7 +306,7 @@ export function createGoalState(draft: GoalDraft, ctx: ExtensionContext, origina
 		commands: (phase.commands ?? []).map((command) => ({ ...command, args: [...command.args], actionClasses: command.actionClasses ? [...command.actionClasses] : undefined })),
 		status: index === 0 ? "in_progress" : "pending",
 		dependsOn: phase.dependsOn ?? (index > 0 ? [`P${index}`] : []),
-		criterionIds: (phase.criterionIds ?? []).filter((id) => criterionIds.has(id)),
+		criterionIds: canonicalCriterionIds(phase.criterionIds ?? [], criterionIds),
 		evidenceIds: [],
 		createdAt: at,
 		updatedAt: at,
@@ -363,7 +387,24 @@ export function normalizeState(raw: unknown): GoalState | undefined {
 	) return undefined;
 	value.generation = Number.isInteger(value.generation) ? value.generation : 1;
 	try { value.workspaceRoots = normalizeWorkspaceRoots(value.cwd, Array.isArray(value.workspaceRoots) ? value.workspaceRoots : []); }
-	catch { value.workspaceRoots = normalizeWorkspaceRoots(value.cwd); }
+	catch {
+		const message = "An approved workspace root failed canonical revalidation.";
+		value.workspaceRoots = [canonicalContextPath(value.cwd), "/"];
+		value.status = "interrupted";
+		value.phase = "blocked";
+		value.completionCandidate = false;
+		value.currentAction = "Workspace containment invalidated";
+		value.nextAction = "Restore the exact approved canonical root, then use bare /goal to resolve or cancel";
+		value.interrupt = {
+			class: "BLOCKER",
+			message,
+			attempts: ["Reload-time canonical workspace-root validation failed closed."],
+			need: "The exact approved canonical workspace root must be restored without symlink substitution.",
+			recommendation: "Restore the root, then inspect with bare /goal; otherwise cancel the goal.",
+			createdAt: now(),
+			signature: sha256(`BLOCKER\n${message}\nThe exact approved canonical workspace root must be restored without symlink substitution.`),
+		};
+	}
 	value.revision = Number.isInteger(value.revision) ? value.revision : 0;
 	value.plan = value.plan.map((node) => ({ ...node, commands: Array.isArray(node.commands) ? node.commands : [] }));
 	value.verificationChecks = Array.isArray(value.verificationChecks) ? value.verificationChecks : [];

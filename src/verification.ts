@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { isAbsolute, relative } from "node:path";
 import { spawn } from "node:child_process";
 import { isSensitivePath, redactText, resolvedPathWithinWorkspaces, safeEvidencePath, workspaceRootForCwd } from "./state.ts";
 import type { GoalState, VerificationCheck, VerificationResult } from "./types.ts";
@@ -128,22 +128,29 @@ export function validateVerificationCheckDefinition(check: VerificationCheck, wo
 				if (/^(?:install|i|add|publish|unpublish|deprecate|login|logout|pack|exec|explore|x|init)$/.test(operation)) throw new Error(`verification package operation is denied: ${operation}`);
 				if (operation === "run" && !/^(?:test|check|lint|build|typecheck|verify)(?::[A-Za-z0-9._-]+)?$/.test(check.args[1] ?? "")) throw new Error("verification npm script is outside the test/check/lint/build allowlist");
 			}
-			if (basename === "git" && !["status", "diff", "show", "log", "rev-parse", "ls-files", "grep"].includes(check.args[0] ?? "")) throw new Error("verification git operation is not read-only");
-			if (check.cwd && !resolvedPathWithinWorkspaces(workspace, workspaceRoots, check.cwd)) throw new Error("verification command cwd must remain within an approved workspace root");
-			if (isAbsolute(check.executable)) checkedPath(workspace, check.executable, workspaceRoots);
+			if (basename === "git") {
+				if (check.args[0] === "-C") throw new Error("verification git -C is unsupported; use check.cwd for the approved root and args beginning with the read-only operation, for example [\"diff\",\"--quiet\",\"HEAD\",\"--\"]");
+				if (!["status", "diff", "show", "log", "rev-parse", "ls-files", "grep"].includes(check.args[0] ?? "")) throw new Error("verification git operation is not read-only");
+			}
+			const commandCwd = check.cwd ? checkedPath(workspace, check.cwd, workspaceRoots) : workspace;
+			if (isAbsolute(check.executable) || /[\\/]/.test(check.executable)) checkedPath(commandCwd, check.executable, workspaceRoots);
 			return;
 		}
 		case "git_status":
+			if (check.cwd && !workspaceRootForCwd(workspace, workspaceRoots, check.cwd)) throw new Error("verification Git cwd must be an exact approved workspace root");
 			return;
-		case "git_diff":
-			for (const path of check.paths ?? []) checkedPath(workspace, path, workspaceRoots);
+		case "git_diff": {
+			const gitCwd = check.cwd ? workspaceRootForCwd(workspace, workspaceRoots, check.cwd) : workspaceRootForCwd(workspace, workspaceRoots, workspace);
+			if (!gitCwd) throw new Error("verification Git cwd must be an exact approved workspace root");
+			for (const path of check.paths ?? []) checkedPath(gitCwd, path, [gitCwd]);
+		}
 	}
 }
 
 function validateExecutable(check: Extract<VerificationCheck, { kind: "command_exit" }>, workspace: string, workspaceRoots: string[]): { executable: string; cwd: string } {
 	validateVerificationCheckDefinition(check, workspace, workspaceRoots);
 	const cwd = check.cwd ? checkedPath(workspace, check.cwd, workspaceRoots) : workspaceRootForCwd(workspace, workspaceRoots, workspace)!;
-	const executable = isAbsolute(check.executable) ? checkedPath(cwd, check.executable, workspaceRoots) : check.executable;
+	const executable = isAbsolute(check.executable) || /[\\/]/.test(check.executable) ? checkedPath(cwd, check.executable, workspaceRoots) : check.executable;
 	return { executable, cwd };
 }
 
@@ -193,7 +200,9 @@ export async function runVerificationCheck(check: VerificationCheck, workspace: 
 				};
 			}
 			case "git_status": {
-				const result = await runProcess("git", ["status", "--porcelain"], workspace, 30_000, signal);
+				const gitCwd = check.cwd ? workspaceRootForCwd(workspace, workspaceRoots, check.cwd) : workspaceRootForCwd(workspace, workspaceRoots, workspace);
+				if (!gitCwd) throw new Error("verification Git cwd must be an exact approved workspace root");
+				const result = await runProcess("git", ["status", "--porcelain"], gitCwd, 30_000, signal);
 				if (result.exitCode !== 0) return { checkId: check.id, passed: false, summary: `git status exited ${result.exitCode}`, exitCode: result.exitCode, durationMs: result.durationMs };
 				const isClean = result.stdout.trim().length === 0;
 				const expectedClean = check.clean !== false;
@@ -201,8 +210,10 @@ export async function runVerificationCheck(check: VerificationCheck, workspace: 
 				return { checkId: check.id, passed, summary: passed ? (expectedClean ? "git worktree is clean" : "git worktree contains changes") : (expectedClean ? "git worktree contains changes" : "git worktree is clean"), exitCode: passed ? 0 : 1, durationMs: result.durationMs };
 			}
 			case "git_diff": {
-				const args = ["diff", "--quiet", ...(check.paths?.length ? ["--", ...check.paths.map((path) => checkedPath(workspace, path, workspaceRoots))] : [])];
-				const result = await runProcess("git", args, workspace, 30_000, signal);
+				const gitCwd = check.cwd ? workspaceRootForCwd(workspace, workspaceRoots, check.cwd) : workspaceRootForCwd(workspace, workspaceRoots, workspace);
+				if (!gitCwd) throw new Error("verification Git cwd must be an exact approved workspace root");
+				const args = ["diff", "--quiet", ...(check.paths?.length ? ["--", ...check.paths.map((path) => relative(gitCwd, checkedPath(gitCwd, path, [gitCwd])) || ".")] : [])];
+				const result = await runProcess("git", args, gitCwd, 30_000, signal);
 				const expectedEmpty = check.empty !== false;
 				const passed = expectedEmpty ? result.exitCode === 0 : result.exitCode === 1;
 				return { checkId: check.id, passed, summary: passed ? (expectedEmpty ? "git diff is empty" : "git diff contains changes") : (expectedEmpty ? "git diff contains changes" : "git diff is empty"), exitCode: result.exitCode, durationMs: result.durationMs };
@@ -213,32 +224,32 @@ export async function runVerificationCheck(check: VerificationCheck, workspace: 
 	}
 }
 
-export function describeVerificationCheck(check: VerificationCheck, workspace: string): string {
+export function describeVerificationCheck(check: VerificationCheck, workspace: string, workspaceRoots: string[] = [workspace]): string {
 	switch (check.kind) {
 		case "file_exists":
 		case "file_contains":
 		case "json_equals":
-			return `path=${JSON.stringify(safeEvidencePath(workspace, check.path))}`;
+			return `path=${JSON.stringify(safeEvidencePath(workspace, check.path, workspaceRoots))}`;
 		case "command_exit": {
-			const cwd = check.cwd ? safeEvidencePath(workspace, check.cwd) : ".";
+			const cwd = check.cwd ? safeEvidencePath(workspace, check.cwd, workspaceRoots) : ".";
 			const executable = redactText(check.executable, 80).text;
 			const argv = redactText(JSON.stringify(check.args.map((arg) => redactText(arg, 240).text)), 900).text;
 			return `executable=${JSON.stringify(executable)} cwd=${JSON.stringify(cwd)} argv=${argv}`;
 		}
 		case "git_status":
-			return `workspace=${JSON.stringify(safeEvidencePath(workspace, "."))}`;
+			return `workspace=${JSON.stringify(check.cwd ? safeEvidencePath(workspace, check.cwd, workspaceRoots) : safeEvidencePath(workspace, ".", workspaceRoots))}`;
 		case "git_diff":
-			return `paths=${redactText(JSON.stringify((check.paths ?? []).map((path) => safeEvidencePath(workspace, path))), 500).text}`;
+			return `workspace=${JSON.stringify(check.cwd ? safeEvidencePath(workspace, check.cwd, workspaceRoots) : safeEvidencePath(workspace, ".", workspaceRoots))} paths=${redactText(JSON.stringify((check.paths ?? []).map((path) => safeEvidencePath(check.cwd ?? workspace, path, check.cwd ? [check.cwd] : workspaceRoots))), 500).text}`;
 	}
 }
 
-function labelApprovedCheckResult(check: VerificationCheck, result: VerificationResult, workspace: string): VerificationResult {
+function labelApprovedCheckResult(check: VerificationCheck, result: VerificationResult, workspace: string, workspaceRoots: string[]): VerificationResult {
 	const label = JSON.stringify(redactText(check.label, 120).text);
-	return { ...result, summary: `setup-approved check ${check.id} ${label} (${describeVerificationCheck(check, workspace)}): ${result.summary}` };
+	return { ...result, summary: `setup-approved check ${check.id} ${label} (${describeVerificationCheck(check, workspace, workspaceRoots)}): ${result.summary}` };
 }
 
 export async function runAllChecks(state: GoalState, signal?: AbortSignal): Promise<VerificationResult[]> {
 	const results: VerificationResult[] = [];
-	for (const check of state.verificationChecks) results.push(labelApprovedCheckResult(check, await runVerificationCheck(check, state.cwd, signal, state.workspaceRoots), state.cwd));
+	for (const check of state.verificationChecks) results.push(labelApprovedCheckResult(check, await runVerificationCheck(check, state.cwd, signal, state.workspaceRoots), state.cwd, state.workspaceRoots));
 	return results;
 }

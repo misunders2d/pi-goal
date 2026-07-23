@@ -25,6 +25,7 @@ import {
 	MAX_SETUP_SUBMISSION_FAILURES,
 	createGoalSetupState,
 	createGoalState,
+	canonicalCriterionIds,
 	canonicalJson,
 	inputHash,
 	makeId,
@@ -137,6 +138,14 @@ export function isInformationalGoalInput(text: string): boolean {
 	return parseGoalInputIntent(text) === "informational";
 }
 
+export function isMaterialSetupCorrectionInput(text: string): boolean {
+	const value = text.trim();
+	if (!value) return false;
+	if (/^(?:correction|contract correction|setup correction|corrected (?:contract|details)|requirement update)\s*:\s*\S/i.test(value)) return true;
+	if (matchesExplicitGoalSteering(value)) return true;
+	return /^(?:use|set|replace|change|correct|update|add|remove)\s+(?:the\s+)?(?:workspace root|path|cwd|criterion|criteria|phase|check|verification|authority|command|scope|constraint|non-goal)\b/i.test(value);
+}
+
 const LEGACY_DOOM_LOOP_MESSAGE = "The same tool call repeated without new evidence.";
 const LEGACY_DOOM_LOOP_NEED = "A materially different approach.";
 const LEGACY_DOOM_LOOP_RECOMMENDATION = "Inspect evidence and replan rather than repeating the call.";
@@ -189,8 +198,8 @@ function approvedCheckContextLine(state: GoalState, check: VerificationCheck): s
 		case "file_contains": return `- ${check.id}: ${label} kind=file_contains path=${JSON.stringify(safeEvidencePath(state.cwd, check.path, state.workspaceRoots))} pattern=${redactedJson(check.pattern, 200)} regex=${check.regex === true}`;
 		case "json_equals": return `- ${check.id}: ${label} kind=json_equals path=${JSON.stringify(safeEvidencePath(state.cwd, check.path, state.workspaceRoots))} pointer=${JSON.stringify(redactText(check.pointer, 120).text)} expected=${redactedJson(check.value, 200)}`;
 		case "command_exit": return `- ${check.id}: ${label} kind=command_exit executable=${JSON.stringify(redactText(check.executable, 80).text)} argv=${redactedJson(check.args.map((arg) => redactText(arg, 240).text), 900)} cwd=${check.cwd ? JSON.stringify(safeEvidencePath(state.cwd, check.cwd, state.workspaceRoots)) : "."} expectedExitCode=${check.expectedExitCode ?? 0}`;
-		case "git_status": return `- ${check.id}: ${label} kind=git_status clean=${check.clean !== false}`;
-		case "git_diff": return `- ${check.id}: ${label} kind=git_diff empty=${check.empty !== false} paths=${redactedJson((check.paths ?? []).map((path) => safeEvidencePath(state.cwd, path, state.workspaceRoots)), 300)}`;
+		case "git_status": return `- ${check.id}: ${label} kind=git_status cwd=${check.cwd ? JSON.stringify(safeEvidencePath(state.cwd, check.cwd, state.workspaceRoots)) : "."} clean=${check.clean !== false}`;
+		case "git_diff": return `- ${check.id}: ${label} kind=git_diff cwd=${check.cwd ? JSON.stringify(safeEvidencePath(state.cwd, check.cwd, state.workspaceRoots)) : "."} empty=${check.empty !== false} paths=${redactedJson((check.paths ?? []).map((path) => safeEvidencePath(check.cwd ?? state.cwd, path, check.cwd ? [check.cwd] : state.workspaceRoots)), 300)}`;
 	}
 }
 
@@ -294,6 +303,10 @@ ${existingContract}${diagnostic}
 Rules:
 - Use this existing conversation normally. Resolve references from prior discussion. Ask concise follow-up questions only when a material requirement remains unclear; do not repeat answered questions and do not impose an arbitrary question limit.
 - Debate conflicting requirements with the user here. Do not inspect or modify workspace, run commands, browse, send, or use other operational tools before contract approval.
+- Local files, attachments/uploads, and screenshot paths cannot be inspected during setup. Ask the user to paste the relevant text, or explain that they can cancel setup, inspect normally, then restart /goal.
+- After a rejected contract, only a material requirement correction resets the bounded retry budget. If user correction is ambiguous, ask them to send \`Correction: <changed root, criterion, check, command, authority, or constraint>\`.
+- Criteria receive deterministic IDs AC1, AC2, ... in array order. Phase criterionIds may use AC<n> or C<n>; unknown IDs are rejected.
+- For Git checks in another approved root, set check.cwd to that root. Do not use git -C in verifier argv.
 - When target, scope, success criteria, verification, and authority are clear, call pi_goal_submit_contract with the complete contract. Do not merely print contract JSON.
 - Current user messages and explicit corrections override older discussion.
 - Contract must preserve complete original request and define observable criteria, ordered phases, machine-readable phase commands, mechanical checks, constraints, non-goals, and all foreseeable typed authorities needed for fire-and-forget completion.
@@ -403,7 +416,7 @@ function hasSafeRiskAlternative(state: GoalState): boolean {
 function normalizePlanNodes(state: GoalState, values: Array<{ id: string; title: string; description?: string; status: string; dependsOn?: string[]; criterionIds?: string[] }>): GoalNode[] {
 	const at = now();
 	const existing = new Map(state.plan.map((node) => [node.id, node]));
-	const criteria = new Set(state.criteria.map((criterion) => criterion.id));
+	const criteria = state.criteria.map((criterion) => criterion.id);
 	const nodes = values.map((value) => {
 		const previous = existing.get(value.id);
 		const status = new Set(["pending", "in_progress", "done", "blocked", "skipped"]).has(value.status) ? value.status as GoalNode["status"] : "pending";
@@ -414,7 +427,7 @@ function normalizePlanNodes(state: GoalState, values: Array<{ id: string; title:
 			commands: previous?.commands ?? [],
 			status,
 			dependsOn: value.dependsOn ?? [],
-			criterionIds: (value.criterionIds ?? []).filter((id) => criteria.has(id)),
+			criterionIds: canonicalCriterionIds(value.criterionIds ?? [], criteria),
 			evidenceIds: previous?.evidenceIds ?? [],
 			createdAt: previous?.createdAt ?? at,
 			updatedAt: at,
@@ -627,13 +640,18 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 	}
 
 	function normalizeAuthorityToolNames(draft: GoalDraft): void {
-		for (const authority of draft.authorities) {
+		const errors: string[] = [];
+		for (const [index, authority] of draft.authorities.entries()) {
 			const raw = authority.toolName.trim();
 			const unwrapped = raw.replace(/^functions(?:[.:/]|__)+/i, "");
 			const resolved = [raw, unwrapped].find((name) => toolInfo.has(name));
-			if (!resolved || resolved.startsWith("pi_goal_")) throw new Error(`contract authority references unavailable operational tool: ${raw}`);
+			if (!resolved || resolved.startsWith("pi_goal_")) {
+				errors.push(`authorities[${index}].toolName references unavailable operational tool: ${raw}`);
+				continue;
+			}
 			authority.toolName = resolved;
 		}
+		if (errors.length) throw new Error(errors.join("; "));
 	}
 
 	function resetSetupSubmissionTracking(state: GoalState): void {
@@ -663,12 +681,13 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			case "authority_tools": return "Use only currently available operational tool names, then submit one complete corrected contract.";
 			case "command_authority": return "Align every declared command with exact executable authority, argv policy, cwd, and action classes, then submit one complete corrected contract.";
 			case "goal_state": return "Repair the reported goal-state or dependency error, then submit one complete corrected contract.";
+			case "contract": return "Repair every listed contract field, then submit one complete corrected contract.";
 			default: return "Repair the reported contract, workspace-root, or mechanical-check error, then submit one complete corrected contract.";
 		}
 	}
 
 	function failSetupSubmission(ctx: ExtensionContext, state: GoalState, stage: SetupSubmissionStage, error: unknown): never {
-		const safeMessage = redactText(error instanceof Error ? error.message : String(error), 500).text;
+		const safeMessage = redactText(error instanceof Error ? error.message : String(error), 3_000).text;
 		const fingerprint = sha256(`${stage}\n${safeMessage}`);
 		state.setupSubmissionFailureCount += 1;
 		state.setupSubmissionFailureRepeatCount = state.lastSetupSubmissionFailureFingerprint === fingerprint
@@ -1098,15 +1117,28 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		if (auditRequested) await finishAudit(ctx, snapshot.goalId, snapshot.generation, sequence);
 	}
 
+	function markGoalCancelled(ctx: ExtensionContext, state: GoalState, eventType: "setup_cancelled" | "goal_cancelled", summary: string): void {
+		const setup = state.status === "setting_up" || state.status === "awaiting_approval";
+		clearVerificationRecoveryTimer();
+		state.status = "cancelled";
+		state.phase = "done";
+		state.setupAwaitingUser = false;
+		state.continuationSequence += 1;
+		state.lastContinuationKey = undefined;
+		state.currentAction = setup ? "Setup cancelled by user" : "Goal cancelled by user";
+		state.nextAction = "No further action";
+		persist(ctx, eventType, summary);
+		updateGoalUi(ctx, undefined);
+		ctx.ui.notify(setup ? "Goal setup cancelled." : "Goal cancelled.", "info");
+	}
+
 	async function handleDetailAction(ctx: ExtensionCommandContext, action: Awaited<ReturnType<typeof showDetailOverlay>>): Promise<void> {
 		if (action === "close") return;
 		if (action === "cancel") {
 			if (!await ctx.ui.confirm("Cancel goal?", "Stop autonomous execution? Existing workspace changes are not reverted.")) return;
 			await mutex.run(() => {
-				const state = load(ctx); if (!state) return;
-				clearVerificationRecoveryTimer();
-				state.status = "cancelled"; state.phase = "done"; state.continuationSequence += 1; state.lastContinuationKey = undefined;
-				persist(ctx, "goal_cancelled", "user cancelled goal"); updateGoalUi(ctx, undefined);
+				const state = load(ctx); if (!state || !isActiveGoal(state)) return;
+				markGoalCancelled(ctx, state, state.status === "setting_up" || state.status === "awaiting_approval" ? "setup_cancelled" : "goal_cancelled", "user cancelled goal from detail panel");
 			});
 			ctx.abort();
 			await isolated.abortAll();
@@ -1178,6 +1210,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			const generation = state.generation;
 			const action = await showSetupCard(ctx, structuredClone(state));
 			let shouldReturn = false;
+			let cancelled = false;
 			await mutex.run(() => {
 				const live = load(ctx);
 				if (!live || live.goalId !== state.goalId || live.generation !== generation || live.status !== "awaiting_approval") {
@@ -1187,14 +1220,8 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				}
 				state = live;
 				if (action === "cancel") {
-					state.status = "cancelled";
-					state.phase = "done";
-					state.currentAction = "Setup cancelled by user";
-					state.nextAction = "No further action";
-					state.continuationSequence += 1;
-					state.lastContinuationKey = undefined;
-					persist(ctx, "setup_cancelled", "user cancelled contract before approval");
-					updateGoalUi(ctx, undefined);
+					markGoalCancelled(ctx, state, "setup_cancelled", "user cancelled contract before approval");
+					cancelled = true;
 					shouldReturn = true;
 					return;
 				}
@@ -1226,7 +1253,10 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				triggerContinuation(state, "The user approved the goal contract and declared authority envelope. Work autonomously until independently verified complete; do not seek routine per-tool approval.");
 				shouldReturn = true;
 			});
-			if (shouldReturn) return;
+			if (shouldReturn) {
+				if (cancelled) { ctx.abort(); await isolated.abortAll(); }
+				return;
+			}
 		}
 	}
 
@@ -1240,6 +1270,20 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			}
 			const outcome = args.trim();
 			const existing = load(ctx);
+			if (outcome && parseGoalInputIntent(outcome) === "cancel") {
+				let cancelled = false;
+				await mutex.run(() => {
+					const live = load(ctx);
+					if (!isActiveGoal(live)) {
+						ctx.ui.notify("No active goal to cancel.", "info");
+						return;
+					}
+					markGoalCancelled(ctx, live, live.status === "setting_up" || live.status === "awaiting_approval" ? "setup_cancelled" : "goal_cancelled", "user cancelled goal with /goal command");
+					cancelled = true;
+				});
+				if (cancelled) { ctx.abort(); await isolated.abortAll(); }
+				return;
+			}
 			if (!outcome) {
 				const transcript = latestSetupTranscript(ctx);
 				if (!existing) {
@@ -1285,8 +1329,8 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		Type.Object({ id: Type.String(), kind: Type.Literal("file_contains"), label: Type.String(), path: Type.String(), pattern: Type.String(), regex: Type.Optional(Type.Boolean()) }),
 		Type.Object({ id: Type.String(), kind: Type.Literal("json_equals"), label: Type.String(), path: Type.String(), pointer: Type.String(), value: Type.Unknown() }),
 		Type.Object({ id: Type.String(), kind: Type.Literal("command_exit"), label: Type.String(), executable: Type.String(), args: Type.Array(Type.String()), cwd: Type.Optional(Type.String()), expectedExitCode: Type.Optional(Type.Integer()), timeoutMs: Type.Optional(Type.Integer({ minimum: 1 })) }),
-		Type.Object({ id: Type.String(), kind: Type.Literal("git_status"), label: Type.String(), clean: Type.Optional(Type.Boolean()) }),
-		Type.Object({ id: Type.String(), kind: Type.Literal("git_diff"), label: Type.String(), empty: Type.Optional(Type.Boolean()), paths: Type.Optional(Type.Array(Type.String())) }),
+		Type.Object({ id: Type.String(), kind: Type.Literal("git_status"), label: Type.String(), cwd: Type.Optional(Type.String()), clean: Type.Optional(Type.Boolean()) }),
+		Type.Object({ id: Type.String(), kind: Type.Literal("git_diff"), label: Type.String(), cwd: Type.Optional(Type.String()), empty: Type.Optional(Type.Boolean()), paths: Type.Optional(Type.Array(Type.String())) }),
 	]);
 	const ActionClassParameter = Type.Union([Type.Literal("workspace_read"), Type.Literal("workspace_write"), Type.Literal("local_process"), Type.Literal("network_read"), Type.Literal("external_write"), Type.Literal("publication"), Type.Literal("destructive")]);
 	const CommandPolicyParameter = Type.Object({
@@ -1315,7 +1359,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "pi_goal_submit_contract",
 		label: "Submit Goal Contract",
-		description: "During same-conversation goal setup, submit the complete contract for one user approval. Include all foreseeable scoped authorities needed for fire-and-forget completion; this tool does not approve or execute work.",
+		description: "During same-conversation goal setup, submit the complete contract for one user approval. Criteria receive AC1, AC2, ... in array order; phase criterionIds may use AC<n> or C<n>. Git checks in another approved root use check.cwd, not git -C. Include all foreseeable scoped authorities; this tool does not approve or execute work.",
 		parameters: Type.Object({
 			...Expected,
 			outcome: Type.Optional(Type.String()),
@@ -1339,23 +1383,24 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			} catch (error) {
 				return failSetupSubmission(ctx, state, "draft", error);
 			}
-			try {
-				normalizeAuthorityToolNames(draft);
-			} catch (error) {
-				return failSetupSubmission(ctx, state, "authority_tools", error);
-			}
+			const postDraftErrors: Array<{ stage: Exclude<SetupSubmissionStage, "draft" | "contract">; message: string }> = [];
+			try { normalizeAuthorityToolNames(draft); }
+			catch (error) { postDraftErrors.push({ stage: "authority_tools", message: error instanceof Error ? error.message : String(error) }); }
 			try {
 				const commandAuthorityErrors = validateDraftCommandAuthorities(draft, ctx.cwd, draft.workspaceRoots);
-				if (commandAuthorityErrors.length) throw new Error(`Contract executable authority is incomplete: ${commandAuthorityErrors.join("; ")}`);
+				if (commandAuthorityErrors.length) postDraftErrors.push({ stage: "command_authority", message: `Contract executable authority is incomplete: ${commandAuthorityErrors.join("; ")}` });
 			} catch (error) {
-				return failSetupSubmission(ctx, state, "command_authority", error);
+				postDraftErrors.push({ stage: "command_authority", message: error instanceof Error ? error.message : String(error) });
 			}
-			let replacement: GoalState;
-			try {
-				replacement = createGoalState(draft, ctx, state.outcome.original);
-			} catch (error) {
-				return failSetupSubmission(ctx, state, "goal_state", error);
+			let replacement: GoalState | undefined;
+			try { replacement = createGoalState(draft, ctx, state.outcome.original); }
+			catch (error) { postDraftErrors.push({ stage: "goal_state", message: error instanceof Error ? error.message : String(error) }); }
+			if (postDraftErrors.length) {
+				const stages = new Set(postDraftErrors.map((item) => item.stage));
+				const stage: SetupSubmissionStage = stages.size === 1 ? postDraftErrors[0]!.stage : "contract";
+				return failSetupSubmission(ctx, state, stage, new Error(`Contract validation failed: ${postDraftErrors.map((item) => `${item.stage}: ${item.message}`).join("; ")}`));
 			}
+			if (!replacement) return failSetupSubmission(ctx, state, "goal_state", new Error("Contract state could not be created"));
 			replacement.goalId = state.goalId;
 			replacement.createdAt = state.createdAt;
 			replacement.generation = state.generation + 1;
@@ -1736,22 +1781,19 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 			const intent = parseGoalInputIntent(text);
 			if (state.status === "setting_up") {
 				if (intent === "cancel") {
-					state.status = "cancelled";
-					state.phase = "done";
-					state.setupAwaitingUser = false;
-					state.continuationSequence += 1;
-					state.lastContinuationKey = undefined;
-					state.currentAction = "Setup cancelled by user";
-					state.nextAction = "No further action";
-					persist(ctx, "setup_cancelled", "same-conversation setup cancelled by user");
-					updateGoalUi(ctx, undefined);
+					markGoalCancelled(ctx, state, "setup_cancelled", "same-conversation setup cancelled by user");
 					abortActive = true;
 					return { action: "handled" as const };
 				}
+				const materialCorrection = isMaterialSetupCorrectionInput(text);
+				if (state.setupSubmissionFailureCount > 0 && !materialCorrection) {
+					ctx.ui.notify('Contract retry budget unchanged. Send a material correction as: "Correction: <changed root, criterion, check, command, authority, or constraint>".', "warning");
+					return { action: "handled" as const };
+				}
 				state.setupAwaitingUser = false;
-				resetSetupSubmissionTracking(state);
+				if (materialCorrection) resetSetupSubmissionTracking(state);
 				restoreSetupActions(state);
-				persist(ctx, "setup_user_reply", "user continued same-conversation setup and reset the bounded contract-submission budget");
+				persist(ctx, "setup_user_reply", materialCorrection ? "user supplied a material contract correction and reset the bounded submission budget" : "user continued same-conversation setup");
 				return;
 			}
 			if (!isActiveGoal(state)) return;
@@ -1773,8 +1815,9 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 				return { action: "handled" as const };
 			}
 			if (intent === "cancel") {
-				clearVerificationRecoveryTimer();
-				state.status = "cancelled"; state.phase = "done"; state.continuationSequence += 1; state.lastContinuationKey = undefined; persist(ctx, "goal_cancelled", "natural-language cancellation"); updateGoalUi(ctx, undefined); abortActive = true; return { action: "handled" as const };
+				markGoalCancelled(ctx, state, "goal_cancelled", "natural-language cancellation");
+				abortActive = true;
+				return { action: "handled" as const };
 			}
 			if (intent === "approve_authority_amendment" && state.interrupt?.pendingAuthorityAmendment) {
 				const count = applyPendingAuthorityAmendment(state);
@@ -1844,7 +1887,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 		const state = load(ctx); if (!state) return;
 		if (state.status === "setting_up") {
 			if (event.toolName === "pi_goal_submit_contract" || event.toolName === "pi_goal_status") return;
-			return { block: true, reason: "Goal setup is conversational and not approved. Ask the user here or submit the complete contract; no operational tools may run yet." };
+			return { block: true, reason: "Goal setup is conversational and not approved. Local files, attachments/uploads, and screenshots cannot be inspected yet; ask the user to paste relevant text, or cancel setup, inspect normally, then restart /goal. Otherwise submit the complete contract." };
 		}
 		if (state.status === "awaiting_approval") {
 			if (event.toolName === "pi_goal_status") return;

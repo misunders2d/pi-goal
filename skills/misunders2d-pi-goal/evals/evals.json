@@ -84,6 +84,36 @@
       "prompt": "Should we put this ordinary project in ClickUp or coordinate it over A2A instead of using /goal?",
       "expected_output": "Keeps this skill scoped to @misunders2d/pi-goal operation and does not invent generic tracker, A2A, or scheduler doctrine; routes such architecture advice to its neighboring owner.",
       "files": []
+    },
+    {
+      "id": 15,
+      "prompt": "Goal setup is stuck. Run /goal cancel, then confirm whether it is still active.",
+      "expected_output": "Uses /goal cancel as a control rather than a new goal outcome, expects immediate cancellation feedback, and verifies durable cancelled status.",
+      "files": []
+    },
+    {
+      "id": 16,
+      "prompt": "The contract failed twice and setup is capped. Here is a screenshot path: /tmp/problem.png. Try the same contract again.",
+      "expected_output": "Does not inspect the local screenshot or retry. Explains that non-material input does not reset the budget and asks for a concrete Correction: message naming changed contract details.",
+      "files": []
+    },
+    {
+      "id": 17,
+      "prompt": "Draft a contract that creates /tmp/new-goal-root, maps phase C1 to the first criterion, and verifies a clean Git diff there with git -C.",
+      "expected_output": "Approves the exact planned root without broadening to /tmp, maps C1 deterministically to AC1, and replaces git -C with an approved check cwd plus read-only Git argv.",
+      "files": []
+    },
+    {
+      "id": 18,
+      "prompt": "Create one adversarial goal that both cancels midway and then completes successfully so every terminal branch is covered.",
+      "expected_output": "Rejects the impossible combined terminal scenario and proposes separate minimal cancellation and successful-completion goals, starting with the smallest realistic smoke test.",
+      "files": []
+    },
+    {
+      "id": 19,
+      "prompt": "Goal setup is active. I attached an image and a text file; inspect both before you submit the contract.",
+      "expected_output": "Refuses to inspect attachments or uploads during preapproval setup. Asks the user to paste the relevant text, or explains that setup must be cancelled before normal inspection and then restarted.",
+      "files": []
     }
   ]
 }

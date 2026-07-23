@@ -66,8 +66,8 @@ export type VerificationCheck =
 			expectedExitCode?: number;
 			timeoutMs?: number;
 	  }
-	| { id: string; kind: "git_status"; label: string; clean?: boolean }
-	| { id: string; kind: "git_diff"; label: string; empty?: boolean; paths?: string[] };
+	| { id: string; kind: "git_status"; label: string; cwd?: string; clean?: boolean }
+	| { id: string; kind: "git_diff"; label: string; cwd?: string; empty?: boolean; paths?: string[] };
 
 export type ActionClass =
 	| "workspace_read"
@@ -269,7 +269,7 @@ export interface AuditReport {
 	createdAt: string;
 }
 
-export type SetupSubmissionStage = "draft" | "authority_tools" | "command_authority" | "goal_state";
+export type SetupSubmissionStage = "draft" | "authority_tools" | "command_authority" | "goal_state" | "contract";
 
 export interface SetupSubmissionDiagnostic {
 	code: "SETUP_CONTRACT_VALIDATION_FAILED";

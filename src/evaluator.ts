@@ -10,7 +10,7 @@ import {
 	type ExtensionContext,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { normalizeWorkspaceRoots, redactText } from "./state.ts";
+import { canonicalCriterionIds, normalizeWorkspaceRoots, redactText, validateDag } from "./state.ts";
 import { validateVerificationCheckDefinition } from "./verification.ts";
 import type {
 	ActionAuthority,
@@ -134,8 +134,8 @@ function normalizeCheck(value: unknown, index: number): VerificationCheck | unde
 			timeoutMs: typeof item.timeoutMs === "number" ? item.timeoutMs : undefined,
 		};
 	}
-	if (kind === "git_status") return { id, label, kind: "git_status", clean: item.clean !== false };
-	if (kind === "git_diff") return { id, label, kind: "git_diff", empty: item.empty !== false, paths: Array.isArray(item.paths) ? item.paths.filter((path): path is string => typeof path === "string") : undefined };
+	if (kind === "git_status") return { id, label, kind: "git_status", cwd: typeof item.cwd === "string" ? item.cwd : undefined, clean: item.clean !== false };
+	if (kind === "git_diff") return { id, label, kind: "git_diff", cwd: typeof item.cwd === "string" ? item.cwd : undefined, empty: item.empty !== false, paths: Array.isArray(item.paths) ? item.paths.filter((path): path is string => typeof path === "string") : undefined };
 	return undefined;
 }
 
@@ -188,6 +188,10 @@ function normalizeAuthority(value: unknown, index: number): Omit<ActionAuthority
 export function normalizeDraft(value: unknown, originalOutcome: string, workspaceCwd?: string): GoalDraft {
 	if (!value || typeof value !== "object") throw new Error("planner returned no goal draft");
 	const item = value as Record<string, unknown>;
+	const errors: string[] = [];
+	const addError = (field: string, message: string) => {
+		if (errors.length < 12) errors.push(`${field}: ${redactText(message, 500).text}`);
+	};
 	const outcome = typeof item.outcome === "string" && item.outcome.trim() ? item.outcome.trim() : originalOutcome;
 	const criteriaSource = item.criteria ?? item.acceptanceCriteria ?? item.acceptance_criteria;
 	const criteria = Array.isArray(criteriaSource) ? criteriaSource.flatMap((entry) => {
@@ -200,9 +204,7 @@ export function normalizeDraft(value: unknown, originalOutcome: string, workspac
 		return cleaned ? [cleaned] : [];
 	}) : [];
 	const processOnlyCriteria = criteria.filter((criterion) => PROCESS_ONLY_AUDIT_CRITERIA.some((pattern) => pattern.test(criterion)));
-	if (processOnlyCriteria.length) {
-		throw new Error(`planner generated process-only audit criteria that cannot be independently evidenced: ${processOnlyCriteria.map((criterion) => JSON.stringify(criterion)).join(", ")}`);
-	}
+	if (processOnlyCriteria.length) addError("criteria", `planner generated process-only audit criteria that cannot be independently evidenced: ${processOnlyCriteria.map((criterion) => JSON.stringify(criterion)).join(", ")}`);
 	const phasesSource = item.phases ?? item.plan;
 	const phases = Array.isArray(phasesSource) ? phasesSource.flatMap((entry, index) => {
 		if (!entry || typeof entry !== "object") return [];
@@ -229,24 +231,48 @@ export function normalizeDraft(value: unknown, originalOutcome: string, workspac
 	const verificationChecks = Array.isArray(checksSource) ? checksSource.map(normalizeCheck).filter((check): check is VerificationCheck => !!check) : [];
 	const authorities = Array.isArray(authoritySource) ? authoritySource.map(normalizeAuthority).filter((authority): authority is Omit<ActionAuthority, "uses"> => !!authority) : [];
 	const requestedWorkspaceRoots = Array.isArray(item.workspaceRoots) ? item.workspaceRoots.filter((entry): entry is string => typeof entry === "string") : undefined;
-	const workspaceRoots = workspaceCwd ? normalizeWorkspaceRoots(workspaceCwd, requestedWorkspaceRoots) : requestedWorkspaceRoots;
-	const keys = Object.keys(item).sort().join(", ");
-	if (criteria.length < 1) throw new Error(`planner returned no observable completion criteria (keys: ${keys})`);
-	if (phases.length < 1) throw new Error(`planner returned no execution phases (keys: ${keys})`);
-	if (verificationChecks.length < 1) throw new Error(`planner returned no mechanical verification checks (keys: ${keys})`);
+	let workspaceRoots = requestedWorkspaceRoots;
 	if (workspaceCwd) {
-		const developmentOnly = verificationChecks.flatMap((check) => {
-			const description = installedPackageDevCheck(check, workspaceCwd);
-			return description ? [`${check.id} ${JSON.stringify(check.label)}: ${description}`] : [];
-		});
-		if (developmentOnly.length) throw new Error(`planner generated development-only verification for an installed package: ${developmentOnly.join("; ")}`);
-		const invalid = verificationChecks.flatMap((check) => {
-			try { validateVerificationCheckDefinition(check, workspaceCwd, workspaceRoots); }
-			catch (error) { return [`${check.id} ${JSON.stringify(check.label)}: ${error instanceof Error ? error.message : String(error)}`]; }
-			return [];
-		});
-		if (invalid.length) throw new Error(`planner generated verifier-incompatible checks: ${invalid.join("; ")}`);
+		try { workspaceRoots = normalizeWorkspaceRoots(workspaceCwd, requestedWorkspaceRoots); }
+		catch (error) {
+			addError("workspaceRoots", error instanceof Error ? error.message : String(error));
+			workspaceRoots = normalizeWorkspaceRoots(workspaceCwd);
+		}
 	}
+	const keys = Object.keys(item).sort().join(", ");
+	if (criteria.length < 1) addError("criteria", `planner returned no observable completion criteria (keys: ${keys})`);
+	if (phases.length < 1) addError("phases", `planner returned no execution phases (keys: ${keys})`);
+	if (verificationChecks.length < 1) addError("verificationChecks", `planner returned no mechanical verification checks (keys: ${keys})`);
+	const validCriterionIds = criteria.map((_criterion, index) => `AC${index + 1}`);
+	for (const [index, phase] of phases.entries()) {
+		try { phase.criterionIds = canonicalCriterionIds(phase.criterionIds ?? [], validCriterionIds); }
+		catch (error) { addError(`phases[${index}].criterionIds`, error instanceof Error ? error.message : String(error)); }
+	}
+	if (phases.length) {
+		const at = new Date().toISOString();
+		const dagErrors = validateDag(phases.map((phase, index) => ({
+			id: phase.id?.trim() || `P${index + 1}`,
+			title: phase.title,
+			description: phase.description,
+			commands: phase.commands,
+			status: index === 0 ? "in_progress" as const : "pending" as const,
+			dependsOn: phase.dependsOn ?? (index > 0 ? [`P${index}`] : []),
+			criterionIds: phase.criterionIds ?? [],
+			evidenceIds: [],
+			createdAt: at,
+			updatedAt: at,
+		})));
+		for (const error of dagErrors) addError("phases", error);
+	}
+	if (workspaceCwd) {
+		for (const [index, check] of verificationChecks.entries()) {
+			const developmentOnly = installedPackageDevCheck(check, workspaceCwd);
+			if (developmentOnly) addError("development-only verification", `verificationChecks[${index}] ${check.id} ${JSON.stringify(check.label)}: ${developmentOnly}`);
+			try { validateVerificationCheckDefinition(check, workspaceCwd, workspaceRoots); }
+			catch (error) { addError("verifier-incompatible check", `verificationChecks[${index}] ${check.id} ${JSON.stringify(check.label)}: ${error instanceof Error ? error.message : String(error)}`); }
+		}
+	}
+	if (errors.length) throw new Error(`Contract validation failed: ${errors.join("; ")}`);
 	return {
 		outcome,
 		workspaceRoots,

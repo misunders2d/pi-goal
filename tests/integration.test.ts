@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -136,6 +136,7 @@ test("same-conversation clarification stays visible and blocks pre-approval work
 		const blocked = (await harness.emit("tool_call", { type: "tool_call", toolName: "read", toolCallId: "r1", input: { path: "package.json" } })).find(Boolean);
 		assert.equal(blocked.block, true);
 		assert.match(blocked.reason, /conversational and not approved/);
+		assert.match(blocked.reason, /Local files, attachments\/uploads, and screenshots cannot be inspected/);
 		const allowed = (await harness.emit("tool_call", { type: "tool_call", toolName: "pi_goal_submit_contract", toolCallId: "s1", input: {} })).find(Boolean);
 		assert.equal(allowed, undefined);
 	} finally { rmSync(root, { recursive: true, force: true }); }
@@ -151,7 +152,55 @@ test("deterministic cancellation aliases work in setup without matching negation
 		await harness.emit("input", { type: "input", source: "interactive", text: "cancel this stuck goal" });
 		assert.equal(latestState(harness).status, "cancelled");
 		assert.equal(harness.aborts, 1);
+		assert.match(harness.notifications.at(-1).message, /cancelled/i);
 	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("/goal cancel is a control for every active phase and never becomes a new outcome", async () => {
+	const emptyRoot = mkdtempSync(join(tmpdir(), "pi-goal-command-cancel-empty-"));
+	try {
+		const empty = makeHarness(emptyRoot);
+		await empty.command("goal", "cancel");
+		assert.equal(empty.branch.length, 0);
+		assert.match(empty.notifications.at(-1).message, /no active goal/i);
+	} finally { rmSync(emptyRoot, { recursive: true, force: true }); }
+
+	for (const status of ["setting_up", "awaiting_approval", "running", "paused", "interrupted", "auditing"] as const) {
+		const root = mkdtempSync(join(tmpdir(), `pi-goal-command-cancel-${status}-`));
+		try {
+			const harness = makeHarness(root);
+			if (status === "setting_up") await harness.command("goal", "Original outcome");
+			else {
+				const state = injectRunning(harness);
+				state.status = status;
+				state.phase = status === "awaiting_approval" ? "setup" : status === "auditing" ? "auditing" : status === "interrupted" ? "blocked" : "executing";
+			}
+			await harness.command("goal", "cancel");
+			assert.equal(latestState(harness).status, "cancelled", status);
+			assert.equal(latestState(harness).outcome.original, status === "setting_up" ? "Original outcome" : draft.outcome);
+			assert.equal(harness.aborts, 1, status);
+			assert.match(harness.notifications.at(-1).message, /cancelled/i, status);
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	}
+});
+
+test("bare /goal panels cancel setup and running goals with immediate feedback", async () => {
+	for (const mode of ["setup", "running"] as const) {
+		const root = mkdtempSync(join(tmpdir(), `pi-goal-panel-cancel-${mode}-`));
+		try {
+			const harness = makeHarness(root);
+			if (mode === "setup") {
+				await harness.command("goal", "Review then cancel");
+				const setup = latestState(harness);
+				await harness.tool("pi_goal_submit_contract", { goalId: setup.goalId, generation: setup.generation, ...draft });
+			} else injectRunning(harness);
+			harness.ctx.ui.custom = async () => "cancel";
+			await harness.command("goal", "");
+			assert.equal(latestState(harness).status, "cancelled");
+			assert.equal(harness.aborts, 1);
+			assert.match(harness.notifications.at(-1).message, /cancelled/i);
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	}
 });
 
 test("validated contract gets one approval then runs with declared authority", async () => {
@@ -185,20 +234,24 @@ test("validated contract gets one approval then runs with declared authority", a
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("contract can approve a canonical secondary workspace root without changing Pi cwd", async () => {
+test("contract can approve a planned canonical secondary workspace root before creation", async () => {
 	const root = mkdtempSync(join(tmpdir(), "pi-goal-contract-multiroot-"));
 	try {
 		const harness = makeHarness(root);
-		const secondary = join(root, "secondary"); mkdirSync(secondary);
+		const secondary = join(root, "secondary");
 		await harness.command("goal", "work in the declared secondary root");
 		const setup = latestState(harness);
 		await harness.tool("pi_goal_submit_contract", {
 			goalId: setup.goalId, generation: setup.generation, ...draft,
 			workspaceRoots: [secondary],
-			verificationChecks: [{ id: "V1", kind: "file_exists", label: "secondary artifact", path: join(secondary, "artifact.txt") }],
+			verificationChecks: [
+				{ id: "V1", kind: "file_exists", label: "secondary artifact", path: join(secondary, "artifact.txt") },
+				{ id: "V2", kind: "git_status", label: "secondary Git clean", cwd: secondary, clean: true },
+			],
 		});
 		let persisted = latestState(harness);
 		assert.deepEqual(persisted.workspaceRoots, [harness.ctx.cwd, secondary]);
+		assert.equal(persisted.verificationChecks[1].cwd, secondary);
 		assert.equal(persisted.cwd, harness.ctx.cwd);
 		harness.ctx.ui.custom = async () => "approve";
 		await harness.command("goal", "");
@@ -356,7 +409,7 @@ test("setup contract submission stops after three distinct validation failures",
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("new setup input resets the submission budget while reload does not", async () => {
+test("only material setup correction resets the submission budget while reload and chatter do not", async () => {
 	const root = mkdtempSync(join(tmpdir(), "pi-goal-setup-reset-"));
 	try {
 		const harness = makeHarness(root);
@@ -375,7 +428,13 @@ test("new setup input resets the submission budget while reload does not", async
 		assert.equal(latestState(harness).setupSubmissionFailureCount, 2);
 		assert.equal(latestState(harness).setupAwaitingUser, true);
 		assert.equal(harness.messages.length, 0);
-		await harness.emit("input", { type: "input", source: "interactive", text: "Use one simple file check" });
+		for (const text of ["okay", "this is frustrating", "/tmp/screenshot.png", "what failed?"]) {
+			await harness.emit("input", { type: "input", source: "interactive", text });
+			assert.equal(latestState(harness).setupSubmissionFailureCount, 2, text);
+			assert.equal(latestState(harness).setupAwaitingUser, true, text);
+			assert.match(harness.notifications.at(-1).message, /Correction:/, text);
+		}
+		await harness.emit("input", { type: "input", source: "interactive", text: "Correction: use one simple file check" });
 		let state = latestState(harness);
 		assert.equal(state.setupSubmissionFailureCount, 0);
 		assert.equal(state.setupSubmissionFailureRepeatCount, 0);
@@ -386,6 +445,36 @@ test("new setup input resets the submission budget while reload does not", async
 		state = latestState(harness);
 		assert.equal(state.setupSubmissionFailureCount, 1);
 		assert.equal(state.setupAwaitingUser, false);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("contract preflight aggregates independently detectable root and verification errors", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-goal-contract-aggregate-"));
+	try {
+		const harness = makeHarness(root);
+		const outside = join(root, "outside"); mkdirSync(outside);
+		const aliased = join(root, "aliased");
+		symlinkSync(outside, aliased);
+		await harness.command("goal", "Report all contract defects together");
+		const setup = latestState(harness);
+		await assert.rejects(() => harness.tool("pi_goal_submit_contract", {
+			goalId: setup.goalId,
+			generation: setup.generation,
+			...draft,
+			workspaceRoots: [aliased],
+			phases: [{ id: "P1", title: "work", criterionIds: ["BAD"] }],
+			verificationChecks: [
+				{ id: "V1", kind: "file_exists", label: "outside", path: join(root, "unapproved", "artifact.txt") },
+				{ id: "V2", kind: "command_exit", label: "git global cwd", executable: "git", args: ["-C", aliased, "diff", "--quiet"] },
+			],
+		}), (error: unknown) => {
+			const message = error instanceof Error ? error.message : String(error);
+			assert.match(message, /workspaceRoots/);
+			assert.match(message, /phases\[0\]\.criterionIds/);
+			assert.match(message, /V1/);
+			assert.match(message, /V2/);
+			return true;
+		});
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 

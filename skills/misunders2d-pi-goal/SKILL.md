@@ -13,7 +13,7 @@ Use `/goal` when work is multi-step, must survive turns/reloads, or needs eviden
 
 When the user asks for copyable goal text, return raw text beginning with literal `/goal`; do not add a heading, fence, or preface.
 
-`/goal <outcome>` starts setup in the current conversation. The original wording remains authoritative. Resolve prior references from conversation context and ask only questions whose answers materially change scope, done conditions, verification, or authority. Do not inspect the workspace or call operational tools before approval.
+`/goal <outcome>` starts setup in the current conversation. The original wording remains authoritative. Resolve prior references from conversation context and ask only questions whose answers materially change scope, done conditions, verification, or authority. Do not inspect the workspace, local files, attachments/uploads, or screenshot paths or call operational tools before approval. During setup, only `pi_goal_submit_contract` and `pi_goal_status` are allowed. Ask the user to paste relevant text; if inspection is essential, explain that setup must be cancelled before normal inspection and then restarted.
 
 ## Submit one complete contract
 
@@ -28,13 +28,26 @@ Call `pi_goal_submit_contract` only after the target is clear. Submit the whole 
 
 Every phase command must have matching executable authority: exact tool, cwd/root, argv policy, required action classes, bounded use count, and hash where applicable. Prose and labels never grant authority. Do not include secrets.
 
-If submission fails, read the complete diagnostic and make one material correction to the full contract. Do not repeat an equivalent payload. The runtime stops setup after two equivalent failures or three distinct failures for one user reply. When capped, stop immediately and ask for clarification or correction in the same conversation. Do not resubmit, restart, create, or recommend a new `/goal` as recovery; the next user reply resets the bounded setup budget.
+Criteria receive IDs `AC1`, `AC2`, ... in array order. Phase `criterionIds` may use `AC<n>` or `C<n>`; unknown references fail validation instead of disappearing. Diagnostics aggregate independently detectable root, criterion, check, authority, and plan defects when possible. Fix every listed field before resubmitting.
+
+A workspace root may be an existing canonical directory or an exact planned absolute child path whose nearest existing ancestor resolves without symlink aliases. Do not approve a broad parent merely to create a child. For built-in `git_status`/`git_diff` or `command_exit` Git checks in another approved root, set the check's `cwd`; do not put `-C` in verifier argv. Use `git diff --quiet HEAD --` when staged and unstaged tracked changes must both be absent.
+
+If submission fails, read the complete diagnostic and make one material correction to the full contract. Do not repeat an equivalent payload. The runtime stops setup after two equivalent failures or three distinct failures for one user reply. When capped, stop immediately. A complaint, acknowledgement, question, attachment/upload, screenshot path, or unrelated message does not reset the budget. Ask the user for `Correction: <changed root, criterion, check, command, authority, or constraint>`, then resubmit only after that material correction. Do not restart or create a new `/goal` as repair-loop recovery.
 
 After a contract validates, tell the user to run bare `/goal` to review, refine, cancel, or approve it. One approval covers only the displayed contract and declared authority envelope. Do not begin work before approval.
 
 ## Human controls
 
-Bare `/goal` is the interactive control surface for approval, progress, pause/resume, interruption resolution, and cancellation. Never treat generic wording such as `I approve it` as approval for a pending risk or authority amendment, and never reply that it was approved. Require bare `/goal`, `approve exact authority amendment`, or `approve exact pending risk once`; each exact phrase approves only its displayed scope. Informational/status questions and neutral acknowledgements such as `okay, continue` do not mutate the goal. Only explicit steering changes the outcome or plan.
+Bare `/goal` is the interactive control surface for approval, progress, pause/resume, interruption resolution, and cancellation. `/goal cancel` and exact cancellation aliases cancel any active setup or goal immediately; negated cancellation remains non-mutating. Never treat generic wording such as `I approve it` as approval for a pending risk or authority amendment, and never reply that it was approved. Require bare `/goal`, `approve exact authority amendment`, or `approve exact pending risk once`; each exact phrase approves only its displayed scope. Informational/status questions and neutral acknowledgements such as `okay, continue` do not mutate the goal. Only explicit steering changes the outcome or plan.
+
+## Common contract patterns
+
+- **File-only:** observable content criteria, file checks, exact write/edit paths, and only the required workspace authority.
+- **Git:** make repository root an approved root; put that root in each Git check's `cwd`; keep mutation commands and read-only verification separate.
+- **Planned root:** declare the exact future directory, not its broad parent; include collision-safe creation and checks rooted at that exact path.
+- **Reload:** keep checks outcome-based; after reload, call `pi_goal_status` and resume from persisted IDs rather than rebuilding the contract.
+
+Start with the smallest realistic smoke path. Test cancellation and successful completion as separate terminal scenarios; one goal cannot finish through both.
 
 ## Execute from durable state
 

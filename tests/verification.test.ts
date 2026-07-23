@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { runAllChecks, runVerificationCheck } from "../src/verification.ts";
+import { runAllChecks, runVerificationCheck, validateVerificationCheckDefinition } from "../src/verification.ts";
 
 test("typed file, JSON, and command checks execute without a shell", async () => {
 	const root = mkdtempSync(join(tmpdir(), "pi-goal-verify-"));
@@ -77,6 +77,61 @@ test("verification command executes in an explicitly approved secondary root", a
 		const denied = await runVerificationCheck({ id: "OUT", kind: "command_exit", label: "outside cwd", executable: "node", args: ["--version"], cwd: outside }, primary, undefined, [primary, secondary]);
 		assert.equal(denied.passed, false);
 		assert.match(denied.summary, /approved workspace/);
+	} finally { rmSync(base, { recursive: true, force: true }); }
+});
+
+test("approved secondary-root file and command summaries remain root-aware", async () => {
+	const base = mkdtempSync(join(tmpdir(), "pi-goal-summary-multiroot-"));
+	try {
+		const primary = join(base, "primary"); const secondary = join(base, "secondary");
+		mkdirSync(primary); mkdirSync(secondary);
+		const marker = join(secondary, "marker.txt"); writeFileSync(marker, "secondary\n");
+		const results = await runAllChecks({
+			cwd: primary,
+			workspaceRoots: [primary, secondary],
+			verificationChecks: [
+				{ id: "FILE", kind: "file_exists", label: "secondary marker", path: marker },
+				{ id: "CMD", kind: "command_exit", label: "secondary command", executable: "node", args: ["-e", "process.exit(0)"], cwd: secondary },
+			],
+		} as any);
+		assert.equal(results.every((result) => result.passed), true);
+		assert.equal(results[0]!.summary.includes(`path=${JSON.stringify(marker)}`), true);
+		assert.equal(results[1]!.summary.includes(`cwd=${JSON.stringify(secondary)}`), true);
+		for (const result of results) assert.doesNotMatch(result.summary, /\[outside-workspace\]/);
+	} finally { rmSync(base, { recursive: true, force: true }); }
+});
+
+test("built-in Git checks honor an approved secondary cwd and command Git prescribes cwd instead of -C", async () => {
+	const base = mkdtempSync(join(tmpdir(), "pi-goal-git-secondary-"));
+	try {
+		const primary = join(base, "primary"); const secondary = join(base, "secondary");
+		mkdirSync(primary); mkdirSync(secondary);
+		execFileSync("git", ["init", "-q"], { cwd: secondary });
+		execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: secondary });
+		execFileSync("git", ["config", "user.name", "Test"], { cwd: secondary });
+		writeFileSync(join(secondary, "tracked.txt"), "clean\n");
+		execFileSync("git", ["add", "--", "tracked.txt"], { cwd: secondary });
+		execFileSync("git", ["commit", "-qm", "initial"], { cwd: secondary });
+		const roots = [primary, secondary];
+		assert.equal((await runVerificationCheck({ id: "STATUS", kind: "git_status", label: "secondary clean", clean: true, cwd: secondary } as any, primary, undefined, roots)).passed, true);
+		assert.equal((await runVerificationCheck({ id: "DIFF", kind: "git_diff", label: "secondary diff", empty: true, cwd: secondary, paths: ["tracked.txt"] } as any, primary, undefined, roots)).passed, true);
+		assert.equal((await runVerificationCheck({ id: "CMD", kind: "command_exit", label: "HEAD clean", executable: "git", args: ["diff", "--quiet", "HEAD", "--"], cwd: secondary }, primary, undefined, roots)).passed, true);
+		assert.throws(
+			() => validateVerificationCheckDefinition({ id: "GLOBAL", kind: "command_exit", label: "global cwd", executable: "git", args: ["-C", secondary, "diff", "--quiet"] }, primary, roots),
+			/use check\.cwd.*args beginning.*diff.*--quiet.*HEAD.*--/i,
+		);
+	} finally { rmSync(base, { recursive: true, force: true }); }
+});
+
+test("relative verifier executable paths cannot escape an approved root", async () => {
+	const base = mkdtempSync(join(tmpdir(), "pi-goal-relative-executable-"));
+	try {
+		const primary = join(base, "primary"); const outside = join(base, "outside"); mkdirSync(primary); mkdirSync(outside);
+		const executable = join(outside, "tool");
+		writeFileSync(executable, "#!/usr/bin/env node\nprocess.exit(0)\n"); chmodSync(executable, 0o755);
+		const result = await runVerificationCheck({ id: "REL", kind: "command_exit", label: "escape", executable: "../outside/tool", args: [] }, primary);
+		assert.equal(result.passed, false);
+		assert.match(result.summary, /leaves the approved workspace/);
 	} finally { rmSync(base, { recursive: true, force: true }); }
 });
 
